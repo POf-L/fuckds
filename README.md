@@ -287,47 +287,90 @@ ENGINE=light LIGHT_CDP_URL=http://127.0.0.1:9222 node scripts/smoke-light.mjs
 
 `ENGINE=hybrid`（默认不启用）：**请求由页面自己发**，Node 只负责抓流和渲染。
 
-- 输入：`Input.dispatchKeyEvent` 逐字输入（`keyDown` 带 `text` + `keyUp`），中文/emoji 用
-  `Input.insertText` 补一对 `rawKeyDown`/`keyUp`，换行用 `Shift+Enter`（普通 Enter 会直接发送）。
-  每一段都会真实产生 `keydown` / `keyup` / `input` 事件，React 受控输入框不需要直接改 `value`。
-- 点击：从元素盒模型取坐标，`Input.dispatchMouseEvent` 走 `mouseMoved` → `mousePressed` →
-  `mouseReleased`，发送前先 hover。
-- 发送前校验：输入框内容与 prompt 完全一致；发送按钮不是停止态、不是 disabled；上一条回复还在
-  生成时先点停止并等恢复，绝不盲点。
-- 抓流：发送前挂 `page.on('response')`，抓页面自身发出的 `/api/v0/chat/completion` **完整 body**
-  （不是首批 chunk），再用 `createSseParser` / `applyPatch` 逐帧回放，OpenAI 与 Anthropic 输出
-  都走原有 chat-runner。**不做 DOM 文本轮询**。
+- 输入：中文走 IME 组合（`Input.imeSetComposition` 产生 `compositionstart/update/end`，
+  再 `insertText` 提交），ASCII 走 `Input.dispatchKeyEvent`（`keyDown` 带 `text` + `keyUp`），
+  换行用 `Shift+Enter`（普通 Enter 会直接发送）。React 受控输入框不直接改 `value`。
+- 打字节奏：非线性——基础间隔随机变速、词间停顿、句末标点长停顿、偶发错字后 Backspace 回退重打。
+- 鼠标：三次贝塞尔曲线（中途加减速 + 垂直弓形 + 轻微抖动），hover 停留，点击前 2~4px 微移，
+  按下/抬起之间 40ms 左右，松手后有轻微漂移；不是两点直线。
+- 点击后校验：输入框内容与 prompt 完全一致；按钮不是停止态/disabled；上一条还在生成时先点停止
+  并等恢复，绝不盲点。
+- 抓流：用 CDP `Network.streamResourceContent` + `Network.dataReceived` 拿**真增量 chunk**，
+  到达即 `createSseParser` / `applyPatch` 并 `onDelta` 推给客户端；页面请求不被暂停，UI 照常渲染。
+  最终仍用整段 body 做权威文本校验（严格前缀补尾），避免重试/分片造成重复。
+  **不做 DOM 文本轮询**。
 - 每轮先把「深度思考 / 智能搜索」拨到请求要求的状态、点「开启新对话」保持一次请求一次会话，
   结束后清空输入框。
 
+### 资源模型：独立 profile + 空闲回收
+
+默认**不再连 `127.0.0.1:9222`，也不碰用户日常 Edge**：使用独立的持久化 profile
+（`data/hybrid-profile`），首次需要登录一次：
+
 ```bash
-# 复用已登录浏览器（推荐）
-ENGINE=hybrid HYBRID_CDP_URL=http://127.0.0.1:9222 npm start
-
-# 或持久化用户目录
-ENGINE=hybrid HYBRID_PROFILE_DIR=data/hybrid-profile npm start
-
-# 单条冒烟：只发一条「你好」，打印脱敏的 initiator 与事件计数
-ENGINE=hybrid HYBRID_CDP_URL=http://127.0.0.1:9222 node scripts/smoke-hybrid.mjs
+npm run auth:hybrid                      # 打开独立 profile，登录一次（登录态留在目录里）
+npm run auth:hybrid -- --from-cdp http://127.0.0.1:9222   # 可选：从已登录浏览器复制 storageState
+ENGINE=hybrid npm start                  # 之后冷启动直接复用
 ```
 
-登录态来源与配置与 light 相同（`HYBRID_*` 优先，未配置时回退 `LIGHT_*`）：`HYBRID_PROFILE_DIR` >
-`HYBRID_CDP_URL` > 默认 `http://127.0.0.1:9222`，profile 模式可加 `HYBRID_STORAGE_STATE`。
-另有 `HYBRID_TYPING_DELAY_MS`（逐字停顿，默认 15ms）、`HYBRID_TYPE_SAMPLE_CHARS`（真实键盘事件的
-样本字符数，默认 80，长 prompt 其余部分用 `insertText` 批量注入）、`HYBRID_NEW_CHAT`（默认 true）。
+- `HYBRID_CDP_URL` 仍然保留，但**只有显式设置才走 CDP 复用外部浏览器**。
+- `HYBRID_IDLE_CLOSE_MS`（默认 **900000 = 15 分钟**，与 browser 引擎一致；0=不关闭）：空闲到点关闭
+  浏览器（Windows 上实测进程数 13 → 0、内存 → 0MB），cookie/localStorage 留在 profile 目录，
+  下个请求自动冷启动拉起。
+- 固定**单标签单页面**：并发请求用信号量排队（`HYBRID_QUEUE_LIMIT`，默认 8），
+  超限立即 429 `queue_overflow`，不会为并发再开标签、也不会无限堆积。
+- 启动参数只保留渲染/首次运行相关项：`--disable-gpu`（只影响合成，不改 `navigator`/UA/JS 特征）、
+  `--no-first-run`、`--no-default-browser-check`、`--disable-blink-features=AutomationControlled`
+  （仅去掉自动化标记，不伪造任何页面特征）。**不设置** `--user-agent`、`--lang`、locale 覆盖或
+  任何 JS 注入；沿用系统 Edge（`HYBRID_CHANNEL=msedge`），UA/`navigator`/客户端提示与日常浏览器一致。
+  Windows 下不加 `--no-sandbox` / `--disable-dev-shm-usage`（那是 Linux 容器参数）。
+
+### 实测数据（本机 Windows / Edge 156 / 真实账号，单条「你好」）
+
+| 指标 | 数值 |
+| --- | --- |
+| 浏览器进程树（活跃） | 13 个进程 / 879~944 MB（含渲染、GPU、网络、存储、identity_helper） |
+| 空闲关闭后 | 0 个进程 / 0 MB（`health().idleClosedAt` 有值） |
+| 冷启动（启动→打开 chat→登录检查） | ~2.8s（不含输入/生成）；整条「你好」往返 7.6~7.7s |
+| 首字延迟（点击发送→客户端第一个 token） | 真增量 **485ms** vs 整段回放 **684ms** |
+| 末字 / 捕获耗时 | 真增量 36ms 内推完 12 个 delta（7 个 network chunk）；回放只有 1 个 delta |
+| 单条消息资源成本 | 活跃驻留约 0.9 GB；空闲 15 分钟后自动归零；每条消息额外 CPU/内存开销≈一轮页面渲染 |
+
+> 对比数据来自 `npm run measure:hybrid -- stream`（同账号同 prompt，两次请求间隔 60s）。
+> 短回答差距绝对值小，但增量模式的首字始终早于「生成结束」，长回答差距会随生成时长线性放大。
+
+### 行为层补齐与开关
+
+| 能力 | 默认 | 关闭方式（对照实验） |
+| --- | --- | --- |
+| IME 组合事件（拼音场景，与直接输入交替） | 开 | `HYBRID_IME=false` |
+| 非线性打字节奏（变速/词停/句末停） | 开 | `HYBRID_TYPING_RHYTHM=false` |
+| 错字回退重打 | 1.5% | `HYBRID_TYPO_RATE=0` |
+| 贝塞尔鼠标轨迹 + hover + 点击前微移 | 开 | `HYBRID_MOUSE_CURVE=false` |
+| 逐字基础间隔 | 45ms | `HYBRID_TYPING_DELAY_MS` |
+
+本地 fixture 实测（`npm run measure:hybrid -- behavior`，29 字中文 prompt）：`mousemove` 4 → 55、
+`compositionstart/update/end` 0/0/0 → 6/18/6、`input` 29 → 33；输入耗时 889ms（30.7ms/字）
+→ 4276ms（147.4ms/字）。
+
+**确实无法模拟的真人行为**（如实列出，不宣称「完全一致」）：
+- 真实 IME 词典与候选人 UI：我们是程序设定拼音串再提交，候选词选择过程、真实按键序列
+  （如 `n i h a o` 的逐键 keydown）不会出现在页面上；只能保证 `composition*` 事件的时序与数量。
+- 真人输入错误的类型/位置分布：目前是固定概率的相邻错字 + 回退，不是真正的认知型错误。
+- 生理级鼠标噪声：贝塞尔+抖动仍是算法生成，缺少人手微颤的频谱特征与跨会话习惯。
+- 剪贴板粘贴、拖拽、语音输入、触控/手写、浏览器扩展行为。
+- 网络与设备指纹的长期一致性：同一 profile 内一致，但换机器/换 Edge 版本会变。
+- 阅读/思考停顿：发送后没有「看屏幕再点发送」的随机延迟分布，只有固定发送间隔。
 
 ### 与 light 的行为差异
 
 | 信号 | light | hybrid |
 | --- | --- | --- |
-| 请求发起者 | 页面上下文里的 `fetch()` | 页面 UI（真实键鼠事件） |
+| 请求发起者 | 页面上下文里的 `fetch()` | 页面 UI（真实键鼠 + IME 事件） |
 | `keydown/keyup/input/click` | 无 | 有（脱敏计数可在 `lastUiTrace` 查看） |
-| 鼠标轨迹 | 无 | 有（移动 + hover + 按下/抬起） |
-| 输入法（IME composition） | 无 | 无（没有真实 IME，`composition*` 事件为 0） |
-| 人类节奏 | 无 | 逐字停顿 + 发送间隔（仍偏机械，可调） |
-| 埋点 / 心跳 | 页面原生的 fetch 不会触发输入埋点 | 输入/点击会触发页面自己的交互埋点 |
-| 依赖 DOM | 不碰 DOM | 依赖输入框/按钮选择器，页面改版会影响 |
-| 流式时间分辨率 | 每个 chunk 实时回传 | body 收完才能读到（Playwright 限制），按帧回放 |
+| 鼠标轨迹 | 无 | 贝塞尔曲线 + hover + 微移 |
+| 输入法（IME composition） | 无 | 有（默认开启，可关） |
+| 流式时间分辨率 | 每个 chunk 实时回传 | CDP Network 真增量，chunk 到达即推送 |
 | 长 prompt | 直接 fetch | 前 80 字符真实输入，其余 `insertText` |
 | 附件 | 支持 `ref_file_ids` | 不支持（返回 400） |
 
@@ -339,8 +382,8 @@ ENGINE=hybrid HYBRID_CDP_URL=http://127.0.0.1:9222 node scripts/smoke-hybrid.mjs
   同一 cookie 集合）」，`smoke-hybrid` 会打印这条告警。
 - 403 / 风控页 / 验证码**立即停止**，不重试、不换号，保留脱敏证据（状态码、content-type、
   是否 HTML、是否验证关键词）。
-- 复用 `HYBRID_CDP_URL` 时会**在你当前打开的 chat.deepseek.com 标签页上真实输入/点击**，
-  并会清空输入框、开启新对话；不要和手工操作同时使用。想完全隔离就用 `HYBRID_PROFILE_DIR`。
+- 显式设置 `HYBRID_CDP_URL` 时会**在你当前打开的 chat.deepseek.com 标签页上真实输入/点击**，
+  并会清空输入框、开启新对话；不要和手工操作同时使用。默认独立 profile 没有这个问题。
 - 与 light 一样是单账号低频使用：只发必要请求，不并发轰炸。
 
 ---

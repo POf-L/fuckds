@@ -41,6 +41,11 @@ const int = (value, fallback) => {
 
 const str = (value, fallback = '') => (value === undefined || value === null ? fallback : String(value).trim());
 
+const num = (value, fallback) => {
+  const n = Number.parseFloat(value ?? '');
+  return Number.isFinite(n) && n >= 0 ? n : fallback;
+};
+
 const expandHome = (p) => (p && p.startsWith('~') ? path.join(os.homedir(), p.slice(1)) : p);
 
 /* ------------------------------------------------------------------ *
@@ -118,24 +123,37 @@ export function loadConfig(env = process.env) {
     },
     // 混合引擎（ENGINE=hybrid）：用真实键鼠事件驱动页面 UI，让页面自己发请求；
     // 回复仍取自页面原生的 completion SSE，不做 DOM 文本轮询。
-    // 登录态配置复用 light 的 CDP / profile / storageState 思路（HYBRID_* 优先，缺省回退 LIGHT_*）。
+    //
+    // 资源策略：默认使用独立的有头 profile（data/hybrid-profile），不碰用户日常浏览器，
+    // 也不默认连 127.0.0.1:9222；只有显式设置 HYBRID_CDP_URL 才复用外部实例。
+    // 空闲到点自动关闭浏览器释放内存，登录态留在 profile 目录，下个请求冷启动。
     hybrid: {
-      cdpUrl: str(env.HYBRID_CDP_URL, '') || str(env.LIGHT_CDP_URL, ''),
-      profileDir: expandHome(str(env.HYBRID_PROFILE_DIR, '')) || expandHome(str(env.LIGHT_PROFILE_DIR, '')),
-      storageState:
-        expandHome(str(env.HYBRID_STORAGE_STATE, '')) || expandHome(str(env.LIGHT_STORAGE_STATE, '')),
-      headless: bool(env.HYBRID_HEADLESS, bool(env.LIGHT_HEADLESS, true)),
-      executablePath:
-        str(env.HYBRID_EXECUTABLE, '') ||
-        str(env.LIGHT_EXECUTABLE, '') ||
-        str(env.CHROMIUM_EXECUTABLE, ''),
-      navigationTimeoutMs: int(env.HYBRID_NAV_TIMEOUT_MS, int(env.LIGHT_NAV_TIMEOUT_MS, 60_000)),
+      cdpUrl: str(env.HYBRID_CDP_URL, ''),
+      profileDir: expandHome(str(env.HYBRID_PROFILE_DIR, '')) || path.join(dataDir, 'hybrid-profile'),
+      storageState: expandHome(str(env.HYBRID_STORAGE_STATE, '')),
+      // 有头更接近真实用户（页面可观测特征不被 headless 化）；无显示环境可显式关掉
+      headless: bool(env.HYBRID_HEADLESS, false),
+      // 独立 profile 优先用系统 Edge（UA/JS 特征与用户日常浏览器一致），失败再回退 Playwright Chromium
+      channel: str(env.HYBRID_CHANNEL, process.platform === 'win32' ? 'msedge' : ''),
+      executablePath: str(env.HYBRID_EXECUTABLE, '') || str(env.CHROMIUM_EXECUTABLE, ''),
+      navigationTimeoutMs: int(env.HYBRID_NAV_TIMEOUT_MS, 60_000),
       reconnectMaxAttempts: int(env.HYBRID_RECONNECT_MAX, 5),
       reconnectTotalMs: int(env.HYBRID_RECONNECT_TOTAL_MS, 30_000),
-      // 逐字输入的字间停顿（毫秒）；0 = 不等待（仍会产生真实的 keydown/keyup）
-      typingDelayMs: int(env.HYBRID_TYPING_DELAY_MS, 15),
-      // 前 N 个字符走真实键盘事件，剩余长 prompt 用 insertText 批量注入（避免 10 万字要打半小时）
+      // 空闲关闭（毫秒）：与 browser 引擎的 15 分钟一致；0 = 不关闭
+      idleCloseMs: int(env.HYBRID_IDLE_CLOSE_MS, 15 * 60_000),
+      // 固定单页面；并发请求排队，超过上限立即 429（不无限堆积）
+      queueLimit: int(env.HYBRID_QUEUE_LIMIT, 8),
+      // incremental：CDP Network.streamResourceContent + dataReceived 逐块推送；
+      // batch：等 body 收完再整体回放（仅用于对照实验）
+      streamMode: /^batch$/i.test(str(env.HYBRID_STREAM_MODE, '')) ? 'batch' : 'incremental',
+      // 逐字输入的基础停顿（毫秒）；实际节奏会在此基础上加随机变速/词间/句末停顿
+      typingDelayMs: int(env.HYBRID_TYPING_DELAY_MS, 45),
       typeSampleChars: int(env.HYBRID_TYPE_SAMPLE_CHARS, 80),
+      // 行为层开关（默认开；关掉用于对照实验）
+      typingRhythm: bool(env.HYBRID_TYPING_RHYTHM, true),
+      ime: bool(env.HYBRID_IME, true),
+      mouseCurve: bool(env.HYBRID_MOUSE_CURVE, true),
+      typoRate: num(env.HYBRID_TYPO_RATE, 0.015),
       // 每轮是否先点「新对话」（保持「一条请求 = 一次全新对话」的语义）
       newChat: bool(env.HYBRID_NEW_CHAT, true),
       // 两次发送之间的最小间隔复用 runtime.sendIntervalMs

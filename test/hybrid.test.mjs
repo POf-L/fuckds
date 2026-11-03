@@ -1,7 +1,15 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { chooseBodyForReplay, keyInfoForChar, sanitizeInitiator } from '../src/hybrid/client.mjs';
+import {
+  bezierPath,
+  charDelayMs,
+  chooseBodyForReplay,
+  hybridLaunchArgs,
+  keyInfoForChar,
+  planTyping,
+  sanitizeInitiator,
+} from '../src/hybrid/client.mjs';
 import { parseCompletionBodies } from '../src/browser/stream-capture.mjs';
 
 const frame = (payload) => `data: ${JSON.stringify(payload)}\n\n`;
@@ -77,4 +85,58 @@ test('chooseBodyForReplay：单段/空列表不抛错', () => {
   const analysis = parseCompletionBodies([only]);
   assert.equal(chooseBodyForReplay([only], analysis), only);
   assert.equal(chooseBodyForReplay([], analysis), '');
+});
+
+/* ------------------------------------------------------------------ *
+ * 行为层纯函数：IME 规划、非线性节奏、贝塞尔轨迹、启动参数
+ * ------------------------------------------------------------------ */
+
+test('planTyping：中文走 IME 组合，ASCII 走键盘，换行走 Enter', () => {
+  const ime = planTyping('你好', { rand: () => 0.5 });
+  const imeActions = ime.filter((a) => a.kind === 'ime');
+  assert.equal(imeActions.length, 1);
+  assert.equal(imeActions[0].word, '你好');
+  assert.equal(ime.filter((a) => a.kind === 'key').length, 0);
+
+  const ascii = planTyping('ab\n', { ime: true, rhythm: false, typoRate: 0, baseMs: 45, rand: () => 0.5 });
+  assert.deepEqual(
+    ascii.filter((a) => a.kind !== 'sleep').map((a) => a.kind),
+    ['key', 'key', 'enter'],
+  );
+});
+
+test('planTyping：偶发输入错误会回退重打（错字 → Backspace → 正确字）', () => {
+  const actions = planTyping('ab', { typoRate: 1, rand: () => 0.01, baseMs: 45 });
+  const kinds = actions.filter((a) => a.kind !== 'sleep').map((a) => a.kind);
+  assert.deepEqual(kinds.slice(0, 3), ['key', 'backspace', 'key']);
+  assert.equal(actions[0].typo, true);
+});
+
+test('charDelayMs：句末停顿显著大于普通字，rhythm 关闭时恒定', () => {
+  const plain = charDelayMs({ baseMs: 45, ch: 'a', rand: () => 0.5 });
+  const period = charDelayMs({ baseMs: 45, ch: '。', rand: () => 0.5 });
+  assert.ok(period > plain + 200, `period=${period} plain=${plain}`);
+  const fixed = charDelayMs({ baseMs: 45, rhythm: false, ch: '。', rand: () => 0.5 });
+  assert.ok(fixed <= 45 + 23);
+});
+
+test('bezierPath：多步曲线、末点精确、延时有加减速变化', () => {
+  const pts = bezierPath({ x: 10, y: 10 }, { x: 400, y: 300 }, { rand: () => 0.3 });
+  assert.ok(pts.length >= 8, `points=${pts.length}`);
+  assert.deepEqual({ x: pts.at(-1).x, y: pts.at(-1).y }, { x: 400, y: 300 });
+  const delays = new Set(pts.map((p) => p.delay));
+  assert.ok(delays.size > 3, `distinct delays=${delays.size}`);
+  // 曲线不是两点直线：中间点不在起终点连线上
+  const mid = pts[Math.floor(pts.length / 2)];
+  const onLine = ((mid.x - 10) * (300 - 10)) / (400 - 10);
+  assert.ok(Math.abs(mid.y - (10 + onLine)) > 1, 'middle point should bow off the straight line');
+});
+
+test('hybridLaunchArgs：Windows 不带 no-sandbox，且不设置 UA', () => {
+  const args = hybridLaunchArgs('win32');
+  assert.ok(args.includes('--disable-gpu'));
+  assert.ok(!args.includes('--no-sandbox'));
+  assert.ok(!args.includes('--disable-dev-shm-usage'));
+  assert.ok(!args.some((a) => a.includes('user-agent')));
+  assert.ok(hybridLaunchArgs('linux').includes('--no-sandbox'));
 });

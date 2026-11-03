@@ -3,8 +3,9 @@
  * hybrid 引擎单条冒烟：只发一条最短消息（"你好"），确认回复来自页面原生补全流。
  *
  *   $env:ENGINE='hybrid'
- *   $env:HYBRID_CDP_URL='http://127.0.0.1:9222'
- *   node scripts/smoke-hybrid.mjs
+ *   node scripts/smoke-hybrid.mjs          # 用独立 profile（npm run auth:hybrid 登录一次）
+ *   # 可选：显式复用已登录浏览器
+ *   $env:HYBRID_CDP_URL='http://127.0.0.1:9222'; node scripts/smoke-hybrid.mjs
  *
  * 不会重试、不会连发；事件记录只有类型与数量，不记录输入/回复内容。
  */
@@ -54,6 +55,14 @@ try {
     reasoningChars: (choice?.message?.reasoning_content || '').length,
   });
   logger.info('回复正文（截断展示）', JSON.stringify(content.slice(0, 200)));
+
+  // 流式模式与耗时：确认走的是真增量（chunk 数、首字/末字相对点击的时间）
+  const status = web.status();
+  logger.info('流式与耗时', {
+    streamMode: status.streamMode,
+    lastStream: status.lastStream,
+    timings: status.lastTimings,
+  });
 
   await new Promise((resolve) => setTimeout(resolve, 300));
 
