@@ -42,7 +42,8 @@ test('powNotExpired：服务端没给 expire_at 时保守认为可用（与旧�
 test('PowSolver 能对已知 challenge 解出正确答案（ds-pow 协议回归）', async (t) => {
   const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
   const bin = process.env.POW_BIN || path.join(root, 'bin', 'ds-pow');
-  if (!fs.existsSync(bin)) {
+  const exists = fs.existsSync(bin) || (process.platform === 'win32' && fs.existsSync(`${bin}.exe`));
+  if (!exists) {
     t.skip(`缺少 ${bin}，先运行 npm run pow:build`);
     return;
   }

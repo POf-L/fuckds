@@ -129,7 +129,8 @@ function makeConfig(baseUrl, dataDir) {
 }
 
 test('坏号 401：同一个请求内自动换到好号，并把坏号停用（不用客户端重发）', async (t) => {
-  if (!fs.existsSync(powBin)) return t.skip('缺少 bin/ds-pow，先 npm run pow:build');
+  const powReady = fs.existsSync(powBin) || (process.platform === 'win32' && fs.existsSync(`${powBin}.exe`));
+  if (!powReady) return t.skip('缺少 bin/ds-pow，先 npm run pow:build');
 
   const state = { completionTokens: [], sessionSeq: 0 };
   const server = await startFakeDeepSeek(state);

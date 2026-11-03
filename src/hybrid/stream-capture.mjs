@@ -292,12 +292,36 @@ export function createHybridStreamCapture({
       return;
     }
 
+    // Network.requestWillBeSentExtraInfo 里有浏览器网络层真正附加的头
+    // （Cookie、sec-fetch-*、priority 等），requestWillBeSent 里看不到。
+    const extraById = new Map();
+    const onExtra = (event) => {
+      if (disposed) return;
+      const extra = hdrsToObject(event.headers);
+      extraById.set(event.requestId, extra);
+      const entry = byRequestId.get(event.requestId);
+      if (entry) {
+        entry.requestHeaders = { ...entry.requestHeaders, ...extra };
+        entry.requestHeaderOrder = [...new Set([...entry.requestHeaderOrder, ...Object.keys(extra)])];
+        if (capture.trace?.requestId === event.requestId) {
+          capture.trace.requestHeaders = entry.requestHeaders;
+          capture.trace.rawOrder = entry.requestHeaderOrder;
+        }
+      }
+      if (entry && Array.isArray(event.associatedCookies) && event.associatedCookies.length) {
+        entry.cookieNames = event.associatedCookies
+          .map((c) => c?.cookie?.name)
+          .filter(Boolean);
+      }
+    };
+
     const onRequest = (event) => {
       if (disposed) return;
       const url = String(event.request?.url || '');
       if (!matches(url)) return;
 
-      const requestHeaders = hdrsToObject(event.request.headers);
+      const extra = extraById.get(event.requestId) || {};
+      const requestHeaders = { ...hdrsToObject(event.request.headers), ...extra };
       const entry = {
         source: 'network',
         requestId: event.requestId,
@@ -317,6 +341,7 @@ export function createHybridStreamCapture({
       if (!capture.trace) {
         capture.trace = {
           source: 'network',
+          requestId: event.requestId,
           url: entry.url,
           status: 0,
           headers: {},
@@ -387,6 +412,7 @@ export function createHybridStreamCapture({
 
     const pairs = [
       ['Network.requestWillBeSent', onRequest],
+      ['Network.requestWillBeSentExtraInfo', onExtra],
       ['Network.responseReceived', onResponse],
       ['Network.dataReceived', onData],
       ['Network.loadingFinished', onFinished],

@@ -4,6 +4,7 @@ import { DeepSeekWeb } from './browser/driver.mjs';
 import { DirectEngine } from './direct/client.mjs';
 import { HybridEngine } from './hybrid/client.mjs';
 import { LightEngine } from './light/client.mjs';
+import { ProtocolEngine } from './protocol/client.mjs';
 
 /**
  * 选择引擎（默认 direct）：
@@ -11,8 +12,15 @@ import { LightEngine } from './light/client.mjs';
  *   ENGINE=browser 只走 Playwright（驱动真实网页，不依赖 PoW 求解器）
  *   ENGINE=light   浏览器网络栈 + 页面内 fetch（不驱动 UI，也不需要 token 文件）
  *   ENGINE=hybrid  真实键鼠事件驱动页面，抓页面原生补全流（不读 DOM 文本）
- *   ENGINE=auto    有 Go 求解器就直连，否则回退浏览器
+ *   ENGINE=protocol 协议优先：Node 直接 HTTPS（cookie + hif + PoW），失败按证据刷新/降级
+ *   ENGINE=auto    有 Go 求解器且已有协议凭据就走 protocol，否则直连/浏览器
  */
+// Go 产物在 Windows 上带 .exe，配置默认值仍是 bin/ds-pow，这里统一判断
+function powBinExists(bin) {
+  if (!bin) return false;
+  return fs.existsSync(bin) || (process.platform === 'win32' && fs.existsSync(`${bin}.exe`));
+}
+
 export function createEngine({ config, logger }) {
   // 未显式指定时默认 direct
   const engine = config.engine ?? 'direct';
@@ -24,10 +32,20 @@ export function createEngine({ config, logger }) {
   if (engine === 'hybrid') {
     return new HybridEngine({ config, logger: logger.child('hybrid') });
   }
+  if (engine === 'protocol') {
+    if (!powBinExists(config.direct.powBin)) {
+      throw new Error(`ENGINE=protocol 需要 PoW 求解器 ${config.direct.powBin}，先执行 npm run pow:build`);
+    }
+    return new ProtocolEngine({ config, logger: logger.child('protocol') });
+  }
 
-  const wantDirect = engine !== 'browser';
-  const binExists = fs.existsSync(config.direct.powBin);
+  const binExists = powBinExists(config.direct.powBin);
   const canDirect = binExists && Boolean(config.deepseek.token);
+  if (engine === 'auto' && binExists && fs.existsSync(config.protocol.credentialsFile)) {
+    logger.info('auto：发现协议凭据，优先走 protocol（不启动浏览器）');
+    return new ProtocolEngine({ config, logger: logger.child('protocol') });
+  }
+  const wantDirect = engine !== 'browser';
 
   if (wantDirect && canDirect) {
     return new DirectEngine({ config, logger: logger.child('direct') });

@@ -101,9 +101,24 @@ export function loadConfig(env = process.env) {
       apiKey: str(env.API_KEY),
       cors: str(env.CORS_ORIGIN, '*'),
     },
-    engine: str(env.ENGINE, 'direct'),
+    // 默认 auto：有协议凭据先走 protocol（纯 HTTP，不拉起浏览器），否则 direct / browser
+    engine: str(env.ENGINE, 'auto'),
     direct: {
       powBin: path.resolve(ROOT, expandHome(str(env.POW_BIN, 'bin/ds-pow'))),
+    },
+    // 协议优先通道（ENGINE=protocol）：Node 直接发 HTTPS，不常驻浏览器。
+    // 凭据（cookie / token / x-hif 缓存）从 hybrid profile 采集后落盘，按需刷新。
+    protocol: {
+      credentialsFile: path.resolve(
+        ROOT,
+        expandHome(str(env.PROTOCOL_CREDENTIALS_FILE, path.join(dataDir, 'protocol-credentials.json'))),
+      ),
+      // 请求失败且证据指向凭据失效时，从 profile 刷新一次凭据再重试
+      refreshOnAuthFail: bool(env.PROTOCOL_REFRESH_ON_AUTH_FAIL, true),
+      // 刷新后仍失败，是否降级到 hybrid 全浏览器
+      fallbackToHybrid: bool(env.PROTOCOL_FALLBACK_HYBRID, true),
+      // 采集凭据时页面停留时间（给风控 SDK 写 hif 缓存的余量）
+      harvestWaitMs: int(env.PROTOCOL_HARVEST_WAIT_MS, 2500),
     },
     // 轻量浏览器传输引擎（ENGINE=light）：网络请求由浏览器自己发出，
     // Node 只负责 PoW 求解与 SSE 补丁渲染。
@@ -146,14 +161,16 @@ export function loadConfig(env = process.env) {
       // incremental：CDP Network.streamResourceContent + dataReceived 逐块推送；
       // batch：等 body 收完再整体回放（仅用于对照实验）
       streamMode: /^batch$/i.test(str(env.HYBRID_STREAM_MODE, '')) ? 'batch' : 'incremental',
-      // 逐字输入的基础停顿（毫秒）；实际节奏会在此基础上加随机变速/词间/句末停顿
-      typingDelayMs: int(env.HYBRID_TYPING_DELAY_MS, 45),
+      // 逐字输入的基础停顿（毫秒）。默认走快速档：仍然逐字产生真实 keydown/keyup/input，
+      // 但不再为了「像人」而人为拖慢。
+      typingDelayMs: int(env.HYBRID_TYPING_DELAY_MS, 6),
       typeSampleChars: int(env.HYBRID_TYPE_SAMPLE_CHARS, 80),
-      // 行为层开关（默认开；关掉用于对照实验）
-      typingRhythm: bool(env.HYBRID_TYPING_RHYTHM, true),
-      ime: bool(env.HYBRID_IME, true),
-      mouseCurve: bool(env.HYBRID_MOUSE_CURVE, true),
-      typoRate: num(env.HYBRID_TYPO_RATE, 0.015),
+      // 拟人化装饰：默认全关（没有证据表明这些能降低风控，且会把长 prompt 拖到几十秒）。
+      // 代码保留，需要对照实验时显式打开。
+      typingRhythm: bool(env.HYBRID_TYPING_RHYTHM, false),
+      ime: bool(env.HYBRID_IME, false),
+      mouseCurve: bool(env.HYBRID_MOUSE_CURVE, false),
+      typoRate: num(env.HYBRID_TYPO_RATE, 0),
       // 每轮是否先点「新对话」（保持「一条请求 = 一次全新对话」的语义）
       newChat: bool(env.HYBRID_NEW_CHAT, true),
       // 两次发送之间的最小间隔复用 runtime.sendIntervalMs

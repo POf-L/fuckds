@@ -402,6 +402,196 @@ async function runStream() {
   }
 }
 
+/**
+ * 单条「你好」：默认配置（拟人化全关）下的端到端耗时、输入阶段耗时、首字延迟，
+ * 以及真实事件计数（确认快速路径仍产生 keydown/keyup/input/beforeinput）。
+ * 只发一条消息，低频验证。
+ */
+async function runSingle() {
+  const config = loadConfig();
+  config.engine = 'hybrid';
+  config.hybrid.cdpUrl = '';
+  config.hybrid.idleCloseMs = 0;
+  const logger = {
+    debug() {},
+    info() {},
+    warn: (...args) => console.warn('[hybrid]', ...args),
+    error: (...args) => console.error('[hybrid]', ...args),
+    child() {
+      return logger;
+    },
+  };
+  const engine = new HybridEngine({ config, logger });
+  try {
+    const startedAt = Date.now();
+    let firstDeltaAt = 0;
+    let deltas = 0;
+    const result = await engine.chat({
+      prompt: '你好',
+      onDelta: () => {
+        deltas += 1;
+        if (!firstDeltaAt) firstDeltaAt = Date.now() - startedAt;
+      },
+    });
+    const totalMs = Date.now() - startedAt;
+    const status = engine.status();
+    const ui = status.lastUiTrace || {};
+    const after = ui.after || {};
+    console.log('\n=== 单条「你好」（默认快速档）===');
+    console.log(JSON.stringify({
+      totalMs,
+      typingMs: status.lastTypingTrace?.typingMs ?? null,
+      keyEventChars: status.lastTypingTrace?.keyEventChars ?? null,
+      imeWords: status.lastTypingTrace?.imeWords ?? null,
+      typos: status.lastTypingTrace?.typos ?? null,
+      prepareMs: result.timings?.prepareMs ?? null,
+      captureMs: result.timings?.captureMs ?? null,
+      firstDeltaMsFromStart: firstDeltaAt || null,
+      firstDeltaAfterClickMs: firstDeltaAt && result.timings?.prepareMs ? firstDeltaAt - result.timings.prepareMs : null,
+      deltas,
+      chunks: result.timings?.chunks ?? null,
+      streamMode: result.timings?.streamMode ?? null,
+      textChars: result.text.length,
+      usage: Boolean(result.usage),
+      events: {
+        keydown: after.keydown,
+        keyup: after.keyup,
+        beforeinput: after.beforeinput,
+        input: after.input,
+        click: after.click,
+        mousedown: after.mousedown,
+        mouseup: after.mouseup,
+        mousemove: after.mousemove,
+        compositionstart: after.compositionstart,
+        compositionend: after.compositionend,
+      },
+      inputMethod: ui.inputMethod,
+      mouseCurve: ui.mouseCurve,
+    }, null, 2));
+    console.log('\n请求指纹（脱敏）:', JSON.stringify(status.lastTrace, null, 2));
+  } finally {
+    await engine.close().catch(() => {});
+  }
+}
+
+/**
+ * 只读审计：不发送任何消息，只列出 cookie 名（不含值）、localStorage 键名、
+ * navigator 可观测字段、页面实际发出的 API 请求里风控头的存在性与变化。
+ * 用独立 profile 直接打开 chat 页面；两次 reload 对比 x-hif / pow 是否每次重新生成。
+ */
+async function runAudit() {
+  const config = loadConfig();
+  const { chromium } = await import('playwright');
+  const { hybridLaunchArgs } = await import('../src/hybrid/client.mjs');
+  const { createHash } = await import('node:crypto');
+  const ctx = await chromium.launchPersistentContext(config.hybrid.profileDir, {
+    headless: false,
+    channel: config.hybrid.channel || undefined,
+    args: hybridLaunchArgs(),
+  });
+  const hash = (v) => (v ? createHash('sha256').update(String(v)).digest('hex').slice(0, 10) : null);
+  const samples = [];
+  const page = ctx.pages()[0] || (await ctx.newPage());
+  const onRequest = (req) => {
+    const url = req.url();
+    if (!/chat\.deepseek\.com\/api\//.test(url)) return;
+    const h = req.headers();
+    const risk = {
+      at: new Date().toISOString(),
+      path: url.replace(/^https:\/\/chat\.deepseek\.com/, '').split('?')[0],
+      has: {
+        pow: Boolean(h['x-ds-pow-response']),
+        leim: Boolean(h['x-hif-leim']),
+        dliq: Boolean(h['x-hif-dliq']),
+        deviceId: Boolean(h['x-device-id']),
+        deviceModel: Boolean(h['x-device-model']),
+      },
+      // 只比较「是否每次都不同」，不保留原值
+      digest: {
+        pow: hash(h['x-ds-pow-response']),
+        leim: hash(h['x-hif-leim']),
+        dliq: hash(h['x-hif-dliq']),
+      },
+    };
+    samples.push(risk);
+  };
+  ctx.on('request', onRequest);
+  try {
+    for (const round of [1, 2]) {
+      await page.goto('https://chat.deepseek.com/', { waitUntil: 'domcontentloaded' }).catch(() => {});
+      await page.waitForFunction(() => Boolean(localStorage.getItem('userToken')), { timeout: 15000 }).catch(() => {});
+      await page.waitForTimeout(2500);
+      console.log(`[audit] 第 ${round} 轮页面请求数=${samples.length}`);
+      if (round === 1) {
+        await page.reload({ waitUntil: 'domcontentloaded' }).catch(() => {});
+        await page.waitForTimeout(2500);
+      }
+    }
+    const cookies = await ctx.cookies('https://chat.deepseek.com');
+    const localKeys = await page.evaluate(() => Object.keys(localStorage)).catch(() => []);
+    // 只看缓存值的结构（键名/类型），不读签名内容
+    const cacheShape = await page.evaluate(() => {
+      const out = {};
+      for (const name of ['hif_leim_cached', 'hif_dliq_cached']) {
+        const raw = localStorage.getItem(name);
+        if (!raw) {
+          out[name] = null;
+          continue;
+        }
+        try {
+          const parsed = JSON.parse(raw);
+          out[name] = {
+            topLevel: Array.isArray(parsed) ? 'array' : typeof parsed,
+            keys: parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? Object.keys(parsed) : [],
+            numericFields: parsed && typeof parsed === 'object'
+              ? Object.keys(parsed).filter((k) => typeof parsed[k] === 'number')
+              : [],
+          };
+        } catch {
+          out[name] = { topLevel: 'string', length: raw.length, keys: [], numericFields: [] };
+        }
+      }
+      return out;
+    }).catch(() => null);
+    const nav = await page.evaluate(() => ({
+      userAgent: navigator.userAgent,
+      webdriver: navigator.webdriver,
+      languages: navigator.languages,
+      platform: navigator.platform,
+      hardwareConcurrency: navigator.hardwareConcurrency,
+      deviceMemory: navigator.deviceMemory,
+      brands: navigator.userAgentData?.brands || null,
+    })).catch(() => null);
+    console.log('\n=== 风控只读审计（无消息发送）===');
+    console.log(JSON.stringify({
+      cookies: cookies.map((c) => ({
+        name: c.name, domain: c.domain, httpOnly: c.httpOnly, secure: c.secure, sameSite: c.sameSite,
+      })), // 只列名与属性，不打印值
+      localStorageKeys: localKeys,
+      hasDeviceId: localKeys.includes('deepseek-device-id:chat'),
+      hifCacheShape: cacheShape,
+      navigator: nav,
+      apiSummary: (() => {
+        const byPath = {};
+        for (const s of samples) {
+          const cur = byPath[s.path] || { requests: 0, has: { ...s.has }, digests: { pow: [], leim: [], dliq: [] } };
+          cur.requests += 1;
+          for (const k of ['pow', 'leim', 'dliq']) {
+            if (s.digest[k] && !cur.digests[k].includes(s.digest[k])) cur.digests[k].push(s.digest[k]);
+          }
+          byPath[s.path] = cur;
+        }
+        return byPath;
+      })(), // 只保留摘要：每个 path 出现次数 + 风控头是否存在 + 签名摘要去重数
+    }, null, 2));
+  } finally {
+    ctx.removeListener('request', onRequest);
+    await ctx.close().catch(() => {});
+  }
+}
+
 if (mode === 'resource') await runResource();
 else if (mode === 'stream') await runStream();
+else if (mode === 'single') await runSingle();
+else if (mode === 'audit') await runAudit();
 else await runBehavior();

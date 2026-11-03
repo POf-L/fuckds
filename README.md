@@ -6,16 +6,19 @@
 
 上下文不打在服务端：每条请求都把历史按 `## System` / `## User` / `## Assistant` / `## Tool_calls` / `## Tool_call_result` 的段落格式拼成一条 prompt，作为一次**全新对话**发给模型。客户端 system 在最上面，自带的协议提示词夹在中间，工具声明和 user/对话历史在后面。
 
-三种引擎，默认 **direct**（Playwright 驱动真实网页）：
+默认 **auto**：有协议凭据先走 **protocol**（纯 HTTP，不拉起浏览器），否则按 direct / browser 降级。
 
-| 引擎 | 原理 | 单轮耗时 | 依赖 |
+| 引擎 | 原理 | 实测单轮 | 依赖 |
 | --- | --- | --- | --- |
+| **protocol**（默认优先） | Node 直接 HTTPS；cookie / `x-hif-*` 从已登录 profile 采集缓存，Go 解 PoW | **warm 1.97s / cold 12.0s**（cold 含 7.6s 采集凭据） | `bin/ds-pow` + 一次已登录 profile |
+| **hybrid** | 真实键鼠事件驱动页面 UI，抓页面原生补全流 | 6.05–8.72s | 已登录浏览器 + `bin/ds-pow` |
+| light | 在已登录浏览器的页面里用 `fetch()` 调接口，chunk 回传 Node | ~2–4s（**本轮未复测**，见下） | 已登录浏览器 + `bin/ds-pow` |
+| direct | 直接调网页内部接口 + Go 解 PoW（只带 token，无 cookie/hif） | ~1.2–1.9s | `bin/ds-pow`（Go 编译） |
 | browser | Playwright 填输入框，DOM 流式展示 + 抓页面原始补全流 | ~2.2–2.9s | Chromium + 依赖库 |
-| **direct**（默认，更快） | 直接调网页内部接口 + Go 解 PoW | **~1.2–1.9s** | `bin/ds-pow`（Go 编译） |
-| light | 在已登录浏览器的页面里用 `fetch()` 调接口，chunk 回传 Node | ~2–4s | 已登录浏览器 + `bin/ds-pow` |
 
-> 风控严格时优先用 **light**：请求由浏览器网络栈发出，TLS/JA3、HTTP/2、头顺序、cookie 与 `x-hif-*`
-> 都和该浏览器一致；direct 只能对齐 HTTP 语义层，TLS 指纹无法与 Chrome 相同。详见下文「light 引擎」。
+> 协议通道已用单账号、单条「你好」实测通过（HTTP 200 / `text/event-stream`），全程无浏览器进程。
+> 需要浏览器侧材料（cookie / hif）时，只在校验/刷新凭据时短暂拉起，取完即关。
+> 详见「协议优先通道」与「三条路径对比」。
 
 
 ```
@@ -287,12 +290,13 @@ ENGINE=light LIGHT_CDP_URL=http://127.0.0.1:9222 node scripts/smoke-light.mjs
 
 `ENGINE=hybrid`（默认不启用）：**请求由页面自己发**，Node 只负责抓流和渲染。
 
-- 输入：中文走 IME 组合（`Input.imeSetComposition` 产生 `compositionstart/update/end`，
-  再 `insertText` 提交），ASCII 走 `Input.dispatchKeyEvent`（`keyDown` 带 `text` + `keyUp`），
-  换行用 `Shift+Enter`（普通 Enter 会直接发送）。React 受控输入框不直接改 `value`。
-- 打字节奏：非线性——基础间隔随机变速、词间停顿、句末标点长停顿、偶发错字后 Backspace 回退重打。
-- 鼠标：三次贝塞尔曲线（中途加减速 + 垂直弓形 + 轻微抖动），hover 停留，点击前 2~4px 微移，
-  按下/抬起之间 40ms 左右，松手后有轻微漂移；不是两点直线。
+- 输入（默认快速档）：逐字 `Input.dispatchKeyEvent`（`keyDown` 带 `text` + `keyUp`），中文补一对
+  `rawKeyDown` + `insertText`；每个字都会产生真实的 `keydown/keyup/input/beforeinput`，
+  基础间隔 6ms。长 prompt 前 80 字符真实按键，其余 `insertText` 分组注入。换行用 `Shift+Enter`。
+  React 受控输入框不直接改 `value`。
+- 鼠标（默认快速档）：`mouseMoved` → `mousePressed` → `mouseReleased` 到元素中心，不做曲线、不停留。
+- 拟人化装饰（IME composition、非线性节奏、错字回退、贝塞尔轨迹）**默认全部关闭**，代码保留，
+  可用 `HYBRID_*` 开关打开做对照——目前没有证据表明这些能降低风控，且会把长 prompt 拖到几十秒。
 - 点击后校验：输入框内容与 prompt 完全一致；按钮不是停止态/disabled；上一条还在生成时先点停止
   并等恢复，绝不盲点。
 - 抓流：用 CDP `Network.streamResourceContent` + `Network.dataReceived` 拿**真增量 chunk**，
@@ -331,45 +335,38 @@ ENGINE=hybrid npm start                  # 之后冷启动直接复用
 | --- | --- |
 | 浏览器进程树（活跃） | 13 个进程 / 879~944 MB（含渲染、GPU、网络、存储、identity_helper） |
 | 空闲关闭后 | 0 个进程 / 0 MB（`health().idleClosedAt` 有值） |
-| 冷启动（启动→打开 chat→登录检查） | ~2.8s（不含输入/生成）；整条「你好」往返 7.6~7.7s |
-| 首字延迟（点击发送→客户端第一个 token） | 真增量 **485ms** vs 整段回放 **684ms** |
+| 冷启动（启动→打开 chat→登录检查） | ~2.8s（不含输入/生成） |
+| 单条「你好」端到端（快速档） | **6.05s**（prepare 4.11s + 抓流 1.80s；另一次 8.72s / prepare 6.94s） |
+| 输入阶段耗时（快速档） | **84~130ms**（2 个字，含聚焦/清空/校验；旧拟人档 4276ms） |
+| 首字延迟（点击发送→客户端第一个 token） | 快速档 **1.73s**（本次生成较慢）；真增量 vs 回放对照 **485ms vs 684ms** |
 | 末字 / 捕获耗时 | 真增量 36ms 内推完 12 个 delta（7 个 network chunk）；回放只有 1 个 delta |
 | 单条消息资源成本 | 活跃驻留约 0.9 GB；空闲 15 分钟后自动归零；每条消息额外 CPU/内存开销≈一轮页面渲染 |
 
-> 对比数据来自 `npm run measure:hybrid -- stream`（同账号同 prompt，两次请求间隔 60s）。
-> 短回答差距绝对值小，但增量模式的首字始终早于「生成结束」，长回答差距会随生成时长线性放大。
+> 数据来自 `npm run measure:hybrid -- single` 与 `-- stream`（同账号同 prompt）。
+> 端到端耗时里冷启动和页面准备占大头，输入阶段已从秒级降到百毫秒级。
 
-### 行为层补齐与开关
+### 拟人化装饰（默认关闭，仅作对照）
 
-| 能力 | 默认 | 关闭方式（对照实验） |
+| 能力 | 默认 | 打开方式 |
 | --- | --- | --- |
-| IME 组合事件（拼音场景，与直接输入交替） | 开 | `HYBRID_IME=false` |
-| 非线性打字节奏（变速/词停/句末停） | 开 | `HYBRID_TYPING_RHYTHM=false` |
-| 错字回退重打 | 1.5% | `HYBRID_TYPO_RATE=0` |
-| 贝塞尔鼠标轨迹 + hover + 点击前微移 | 开 | `HYBRID_MOUSE_CURVE=false` |
-| 逐字基础间隔 | 45ms | `HYBRID_TYPING_DELAY_MS` |
+| IME composition 序列 | 关 | `HYBRID_IME=true` |
+| 非线性打字节奏（变速/词停/句末停） | 关 | `HYBRID_TYPING_RHYTHM=true` |
+| 错字回退重打 | 0 | `HYBRID_TYPO_RATE=0.015` |
+| 贝塞尔鼠标轨迹 + hover + 点击前微移 | 关 | `HYBRID_MOUSE_CURVE=true` |
+| 逐字基础间隔 | 6ms | `HYBRID_TYPING_DELAY_MS` |
 
-本地 fixture 实测（`npm run measure:hybrid -- behavior`，29 字中文 prompt）：`mousemove` 4 → 55、
-`compositionstart/update/end` 0/0/0 → 6/18/6、`input` 29 → 33；输入耗时 889ms（30.7ms/字）
-→ 4276ms（147.4ms/字）。
-
-**确实无法模拟的真人行为**（如实列出，不宣称「完全一致」）：
-- 真实 IME 词典与候选人 UI：我们是程序设定拼音串再提交，候选词选择过程、真实按键序列
-  （如 `n i h a o` 的逐键 keydown）不会出现在页面上；只能保证 `composition*` 事件的时序与数量。
-- 真人输入错误的类型/位置分布：目前是固定概率的相邻错字 + 回退，不是真正的认知型错误。
-- 生理级鼠标噪声：贝塞尔+抖动仍是算法生成，缺少人手微颤的频谱特征与跨会话习惯。
-- 剪贴板粘贴、拖拽、语音输入、触控/手写、浏览器扩展行为。
-- 网络与设备指纹的长期一致性：同一 profile 内一致，但换机器/换 Edge 版本会变。
-- 阅读/思考停顿：发送后没有「看屏幕再点发送」的随机延迟分布，只有固定发送间隔。
+打开后的对照实测（本地 fixture，29 字中文 prompt）：`mousemove` 4 → 55、
+`compositionstart/update/end` 0/0/0 → 6/18/6、输入耗时 889ms → 4276ms。**结论：这些装饰没有
+可证实的风控收益，只增加耗时；默认档只保留「真实按键事件 + 真实鼠标点击」这一必要条件。**
 
 ### 与 light 的行为差异
 
 | 信号 | light | hybrid |
 | --- | --- | --- |
-| 请求发起者 | 页面上下文里的 `fetch()` | 页面 UI（真实键鼠 + IME 事件） |
+| 请求发起者 | 页面上下文里的 `fetch()` | 页面 UI（真实键鼠事件） |
 | `keydown/keyup/input/click` | 无 | 有（脱敏计数可在 `lastUiTrace` 查看） |
-| 鼠标轨迹 | 无 | 贝塞尔曲线 + hover + 微移 |
-| 输入法（IME composition） | 无 | 有（默认开启，可关） |
+| 鼠标轨迹 | 无 | 真实 move/down/up 到元素中心（可选贝塞尔，默认关） |
+| 输入法（IME composition） | 无 | 可选（默认关，不产生 composition 事件） |
 | 流式时间分辨率 | 每个 chunk 实时回传 | CDP Network 真增量，chunk 到达即推送 |
 | 长 prompt | 直接 fetch | 前 80 字符真实输入，其余 `insertText` |
 | 附件 | 支持 `ref_file_ids` | 不支持（返回 400） |
@@ -385,6 +382,112 @@ ENGINE=hybrid npm start                  # 之后冷启动直接复用
 - 显式设置 `HYBRID_CDP_URL` 时会**在你当前打开的 chat.deepseek.com 标签页上真实输入/点击**，
   并会清空输入框、开启新对话；不要和手工操作同时使用。默认独立 profile 没有这个问题。
 - 与 light 一样是单账号低频使用：只发必要请求，不并发轰炸。
+
+### DeepSeek 风控信号清单（实测证据）
+
+证据来自一次真实 `POST /api/v0/chat/completion`（200，SSE）的脱敏 trace：32 个请求头、
+cookie 名（不含值）、initiator 为页面 bundle；以及一次只读审计（cookie 属性、localStorage 键、navigator）。
+
+| 风控信号 | 当前是否对齐 | 证据来源 | 硬依赖判断 |
+| --- | --- | --- | --- |
+| `authorization`（Bearer） | 对齐 | completion 请求头存在；profile localStorage `userToken` 存在 | 必需（缺失即 401） |
+| `x-ds-pow-response` | 对齐（页面计算） | completion 头存在；页面先请求 `/api/v0/chat/create_pow_challenge` | 必需（direct 引擎同样必须带） |
+| `x-hif-leim` / `x-hif-dliq` | 对齐（页面注入） | completion 两个头都存在；localStorage 有 `hif_leim_cached` / `hif_dliq_cached`（字符串） | 高概率；**刷新周期未验证** |
+| cookie 集合 | 对齐（浏览器自动） | completion 实发 `smidV2`、`.thumbcache_*`、`HWWAFSESTIME`、`HWWAFSESID`、`ds_session_id`；后两者 WAF httpOnly | 必需（会话与 WAF） |
+| UA + `sec-ch-ua` 一致性 | 对齐 | UA `Chrome/156 Edg/156`；`sec-ch-ua` = Edge 156 / Chromium 156 / Not:A-Brand 8；platform `"Windows"` | 高概率 |
+| `x-client-version` / `x-client-bundle-id` / `x-client-platform` / `x-client-locale` / `x-client-timezone-offset` | 对齐（页面生成） | 实测值 `2.7.0` / 存在 / `web` / `zh_CN` | 高概率 |
+| `x-device-model` | 与页面一致 | 头存在但值为空（presence=false，属页面行为） | 未知 |
+| `dnt` | 对齐 | 实测 `1`（Edge 默认） | 未知 |
+| `accept-language` | 对齐 | `zh-CN`（浏览器默认，未覆盖） | 高概率 |
+| `Referer` | 对齐 | 实际为当前会话页 `https://chat.deepseek.com/a/chat/s/<id>`（已去查询串） | 高概率 |
+| `sec-fetch-site/mode/dest` / `origin` / `priority` | 对齐 | `requestWillBeSentExtraInfo` 中全部出现（浏览器网络层自动） | 高概率 |
+| 设备 ID（`deepseek-device-id:chat` → `x-device-id`） | 对齐 | localStorage 键存在；completion 头存在；profile 持久化 | 高概率（换 ID 会触发 `check_device`） |
+| 请求频率 / 并发度 | 单账号低频、单页排队 | 信号量 1 + 队列上限 8；无并发标签 | 未知阈值（未做边界实验） |
+| 账号维度 | 单账号 | 一个 profile 一份 `userToken` | 必需 |
+| TLS / HTTP2 指纹 | hybrid/light 对齐；protocol 不一致 | hybrid/light 请求由 Edge 网络栈发出；protocol 由 Node 发出，单条实测 200 未被拒，但是否被识别**未验证** | 未验证 |
+| IP / 账号历史行为 | 未验证 | 无数据 | 未知 |
+
+**仍然缺失或不确定的项**（有证据才写有，没有就写未验证）：
+- `x-hif-leim` / `x-hif-dliq` 的具体签名算法与缓存 TTL：只知道页面把它缓存在 localStorage，
+  **没有验证过期后是否会重新计算、以及复用旧签名会不会被拒**（未做对比实验）。
+- 输入速度是否被埋点并用于风控：快速档 6ms/字（2 字耗时 84~130ms），**没有证据表明有阈值**。
+- 默认关闭 IME/曲线/节奏后，页面是否仍记录「非人类」行为：`keydown/keyup/input/beforeinput` 与
+  鼠标 down/up 都是真实的，但**时序特征是否被使用未知**。
+- 账号历史、IP、代理、并发峰值：这些不在客户端控制范围，未验证。
+
+---
+
+## 协议优先通道（protocol 引擎）
+
+`ENGINE=protocol`（`ENGINE=auto` 在发现 `data/protocol-credentials.json` 时自动选它）：
+**Node 直接发 HTTPS 到 chat.deepseek.com，正常请求期间没有任何浏览器进程。**
+
+```bash
+npm run auth:hybrid          # 一次性：登录独立 profile（登录态留在 data/hybrid-profile）
+ENGINE=protocol npm start     # 首次请求会打开浏览器几秒「取凭据」，之后纯 Node
+```
+
+- **请求构造**复用 DirectEngine：`/api/v0/chat_session/create` → `create_pow_challenge` →
+  本地 Go 求解 → `/api/v0/chat/completion`（SSE patch），会话/补全/上传接口不变。
+- **头全集**来自实测请求（32 个头）：UA、`sec-ch-ua` / `sec-ch-ua-mobile` / `sec-ch-ua-platform`
+  取自浏览器 `navigator.userAgentData`；`x-client-version` / `x-client-bundle-id` /
+  `x-client-platform` / `x-client-locale` / `x-client-timezone-offset` / `x-device-id` /
+  `x-device-model`（空值）/ `dnt` / `accept-language` / `sec-fetch-*` / `origin` / `priority` 对齐线上；
+  `Referer` 是本次会话页 `/a/chat/s/<sessionId>`。
+- **cookie**：从已登录 profile 取（CDP/Playwright context cookies，含 HttpOnly 的
+  `HWWAFSESID`、`ds_session_id`）；**`x-hif-leim` / `x-hif-dliq`**：从页面 localStorage 的
+  `hif_leim_cached` / `hif_dliq_cached` 读取。凭据落盘到 `data/protocol-credentials.json`（mode 0600，
+  `data/` 已 gitignore），日志与 `/healthz` 只输出数量/布尔，不输出值。
+- **降级顺序**：协议通道 → 失败且证据指向凭据失效（401/403、`Authorization Failed`、
+  `invalid token`、`40003`）→ 从 profile 刷新一次凭据后重试 → 仍失败才降级 hybrid 全浏览器。
+  每次降级都记原因；`GET /healthz` 暴露 `layer`（`protocol` / `hybrid`）、`degradations`、
+  `lastReason`、`credentialSource`（`cache` / `harvested`）、`lastRefreshAt`、`lastHarvestMs`
+  和凭据摘要（名字/布尔，不含值）。
+- 采集失败（profile 未登录、浏览器起不来）本身也触发降级，不会静默重试。
+- **不做**：不伪造 TLS 指纹、不改 Node 网络栈、不新增没有抓包证据的模拟项。
+
+### 协议通道实测（单账号，单条「你好」）
+
+| 场景 | 总耗时（进程启动→回复结束） | 请求内部耗时 | 输入阶段 | 首字延迟 | 浏览器进程 | Node RSS |
+| --- | --- | --- | --- | --- | --- | --- |
+| **cold**（无凭据文件，先采集） | **12.0s**（采集 7.55s + 请求 1.67s + 启动/加载） | 建会话+PoW 331ms；总 1666ms（首字 1466ms） | 无（协议请求） | 11816ms（从进程启动算） | 0 | 73 MB |
+| **warm**（复用凭据缓存） | **1.97s** | 建会话+PoW 413ms；总 1245ms（首字 1052ms） | 无 | 1779ms（从进程启动算）/ 1052ms（从请求算） | 0 | 73→80 MB |
+
+- 两次都是 `HTTP 200` + `text/event-stream`，回复完整：
+  cold「你好！很高兴见到你，有什么我可以帮你的吗？」（21 字，12 个 delta）；
+  warm「你好！有什么可以帮你的吗？」（13 字，8 个 delta）。
+- warm 复用上一次采集的凭据（age 12.3s）仍有效；`layer=protocol`、`degradations=0`、无降级。
+- 本机进程树统计为 0 个 msedge/chrome 子进程（采集结束后浏览器已关闭），内存是 Node 量级。
+- 数据来自 `node scripts/measure-protocol.mjs [--cold]`（同账号同 prompt，只发这一条）。
+
+### 三条路径对比
+
+| 路径 | 耗时（单条「你好」） | 内存 | 依赖浏览器 | 风控暴露面 |
+| --- | --- | --- | --- | --- |
+| **protocol**（Node HTTPS） | **warm 1.97s / cold 12.0s** | Node RSS 73–80MB；浏览器 0 进程 | 仅取/刷凭据时短暂启动 | HTTP 语义层与浏览器一致（cookie/hif/UA/CH/Referer）；TLS/HTTP2 由 Node 发出，与 Edge 不同（是否被识别**未验证**） |
+| light（页面 fetch） | 2–4s（历史值，**本轮未复测**） | 浏览器级（未单独测） | 全程 | 浏览器网络栈，TLS/JA3/HTTP2/头顺序与浏览器一致 |
+| hybrid（真实交互） | 6.05–8.72s（输入 84–130ms，首字 1.73s） | 活跃 13 进程 879–944MB，空闲 0 | 全程 | 真实键鼠事件 + 真实页面，暴露面最小 |
+
+> light 本轮未复测的原因：本机没有已登录的 light profile，9222 也未开启；尝试
+> ①直接用 Playwright Chromium 打开 `data/hybrid-profile`、②注入 `storageState` 到临时 profile，
+> 两种方式 light 都判定「没有 userToken」（`deepseek_auth_required`）。说明 Edge 的 profile 不能
+> 直接被 Playwright Chromium 复用，light 需要自己的登录态或连 CDP。没有把估算值当实测值填表。
+
+### 凭据有效期与刷新机制
+
+| 材料 | 来源 | 能静态复用吗 | 有效期 / 刷新 |
+| --- | --- | --- | --- |
+| `smidV2` | profile cookie | 是 | 服务端下发过期时间；具体时长**未验证** |
+| `HWWAFSESTIME` / `HWWAFSESID` | profile cookie（httpOnly） | 是 | WAF 会话；过期需浏览器重新走一次页面，**时长未验证** |
+| `ds_session_id` | profile cookie（httpOnly） | 是 | 登录会话；失效表现为 401/403 → 触发刷新 |
+| `userToken` | profile localStorage | 是（解包 `{value}` / 字符串） | 登录态；warm 12s 后仍有效，长期时长**未验证** |
+| `deepseek-device-id:chat` | profile localStorage | 是 | 长期稳定；换 ID 会触发 `check_device` |
+| `hif_leim_cached` / `hif_dliq_cached` | profile localStorage | 是（页面缓存的字符串） | TTL **未验证**；复用旧签名会不会被拒也**未验证** |
+| PoW | 本地 Go 求解器，按 challenge 现算 | — | 每次请求新 challenge；`expire_at` 有安全余量 |
+
+刷新机制：`PROTOCOL_REFRESH_ON_AUTH_FAIL=true` 时，遇到凭据类错误会关闭旧凭据、重新打开
+profile 采集一次并覆盖落盘，再重试**一次**；仍失败且 `PROTOCOL_FALLBACK_HYBRID=true` 才升级 hybrid。
+**本轮没有刻意构造 401/403 实验**（避免探测封号边界），刷新与降级链路只有单测覆盖，真实触发标为**未验证**。
 
 ---
 
@@ -646,8 +749,12 @@ npm run auth -- --list      # 查看号池（token 打码）
 
 | 变量 | 默认 | 说明 |
 | --- | --- | --- |
-| `ENGINE` | `direct` | `browser` / `direct`（需 ds-pow，更快）/ `light`（浏览器网络栈，需已登录浏览器 + ds-pow）/ `hybrid`（真实键鼠驱动页面 UI，需已登录浏览器）/ `auto`（有 ds-pow 就直连） |
+| `ENGINE` | `auto` | `auto`（有协议凭据先走 protocol，否则 direct / browser）/ `protocol`（纯 HTTP，需 ds-pow + 一次已登录 profile）/ `direct`（需 ds-pow + token）/ `light`（浏览器网络栈，需已登录浏览器 + ds-pow）/ `hybrid`（真实键鼠驱动页面 UI，需已登录浏览器）/ `browser` |
 | `POW_BIN` | `bin/ds-pow` | Go PoW 求解器路径 |
+| `PROTOCOL_CREDENTIALS_FILE` | `data/protocol-credentials.json` | 协议通道凭据文件（token/cookie/hif，0600） |
+| `PROTOCOL_REFRESH_ON_AUTH_FAIL` | `true` | 401/403/40003 时刷新凭据并重试一次 |
+| `PROTOCOL_FALLBACK_HYBRID` | `true` | 刷新后仍失败时降级 hybrid |
+| `PROTOCOL_HARVEST_WAIT_MS` | `2500` | 采集凭据时页面停留时间 |
 | `DEEPSEEK_USER_TOKEN` | – | 登录态，推荐 `npm run auth` 写文件 |
 | `DEEPSEEK_THINKING` | `always` | `always` / `auto` / `never` |
 | `DEEPSEEK_SEARCH` | `false` | 是否开「智能搜索」 |

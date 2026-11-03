@@ -19,6 +19,7 @@
     "smoke:hybrid": "node scripts/smoke-hybrid.mjs",
     "auth:hybrid": "node scripts/login-hybrid.mjs",
     "measure:hybrid": "node scripts/measure-hybrid.mjs",
+    "measure:protocol": "node scripts/measure-protocol.mjs",
     "test": "node --test --test-concurrency=1",
     "setup:deps": "bash scripts/install-chromium-deps.sh",
     "setup:browser": "playwright install chromium",

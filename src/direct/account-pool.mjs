@@ -11,13 +11,15 @@ import path from 'node:path';
  * 每个账号有独立的：门禁（冷却）、PoW 预解、会话预建、设备 ID。
  */
 export class AccountPool {
-  constructor({ tokens, dataDir, logger }) {
+  constructor({ tokens, dataDir, logger, deviceIds = {} }) {
     this.log = logger;
     this.dataDir = dataDir;
     this.accounts = tokens.map((token, index) => ({
       index,
       token,
-      deviceId: loadDeviceId(dataDir, token),
+      // 协议通道会注入浏览器 profile 里真实的 deepseek-device-id:chat；
+      // 没有注入时沿用按 token 派生的稳定设备 ID。
+      deviceId: deviceIds[token] || loadDeviceId(dataDir, token),
       powNext: null,
       sessionPool: [],
       cooldownUntil: 0,

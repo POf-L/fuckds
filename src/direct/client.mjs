@@ -84,7 +84,12 @@ export class DirectEngine {
       ? config.deepseek.tokens
       : [config.deepseek.token].filter(Boolean);
 
-    this.pool = new AccountPool({ tokens: this.tokens, dataDir: config.dataDir, logger });
+    this.pool = new AccountPool({
+      tokens: this.tokens,
+      dataDir: config.dataDir,
+      logger,
+      deviceIds: config.deepseek.deviceIds || {},
+    });
     this.pow = new PowSolver({ bin: config.direct.powBin, logger });
     this.fileCache = new Map();
     this.inflight = 0;
@@ -570,6 +575,7 @@ export class DirectEngine {
       profileName: this.config.deepseek.deviceProfile || 'chrome-win',
       locale: 'zh_CN',
       timezoneOffsetSec: -new Date().getTimezoneOffset() * 60,
+      extra: this.config.deepseek.protocolExtras || {},
     });
   }
 

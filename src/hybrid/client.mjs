@@ -42,6 +42,27 @@ const MUTED_HEADER_NAMES = [
   'x-ds-pow-response',
   'x-hif-leim',
   'x-hif-dliq',
+  'dnt',
+  'sec-ch-ua',
+  'sec-ch-ua-mobile',
+  'sec-ch-ua-platform',
+  'x-client-platform',
+  'x-client-locale',
+];
+
+/** 可以在日志里展示「值」的头：都是可观测指纹/协议字段，不含凭据 */
+const SAFE_HEADER_VALUES = [
+  'user-agent',
+  'sec-ch-ua',
+  'sec-ch-ua-mobile',
+  'sec-ch-ua-platform',
+  'accept-language',
+  'dnt',
+  'x-client-version',
+  'x-client-platform',
+  'x-client-locale',
+  'x-device-model',
+  'referer',
 ];
 
 /**
@@ -566,6 +587,10 @@ export class HybridEngine {
       streamMode: this.#hybrid.streamMode || 'incremental',
       lastStream: this.lastStreamStats,
       lastTimings: this.lastTimings || null,
+      lastTypingTrace: this.lastTypingTrace || null,
+      lastUiTrace: this.lastUiTrace || null,
+      lastTrace: this.lastTrace || null,
+      lastInitiator: this.lastInitiator || null,
       token: Boolean(this.identityCache?.signedIn),
     };
   }
@@ -944,7 +969,9 @@ export class HybridEngine {
       after: after.counts,
       sequence: after.sequence,
       clickMethod: 'Input.dispatchMouseEvent',
-      inputMethod: 'Input.dispatchKeyEvent + Input.insertText + Input.imeSetComposition',
+      inputMethod: this.#hybrid.ime
+        ? 'Input.dispatchKeyEvent + Input.insertText + Input.imeSetComposition'
+        : 'Input.dispatchKeyEvent + Input.insertText',
       mouseCurve: this.#hybrid.mouseCurve !== false,
     };
     this.log.info('hybrid 真实交互事件（脱敏，只有类型/数量）', {
@@ -964,8 +991,8 @@ export class HybridEngine {
   }
 
   /**
-   * 只做输入（不发送）：鼠标轨迹 → 点击聚焦 → 非线性节奏逐字输入 → 校验 → 返回事件统计。
-   * 供 chat 与 simulateTyping 复用。
+   * 只做输入（不发送）：点击聚焦 → 逐字真实按键（默认快速档）→ 校验 → 返回事件统计。
+   * 拟人节奏/IME 打开时才走慢速路径。供 chat 与 simulateTyping 复用。
    */
   async #typePrompt(prompt, signal) {
     const page = this.page;
@@ -985,11 +1012,13 @@ export class HybridEngine {
 
     const box = await page.evaluate(() => window.__HYBRID__.inputBox());
     if (!box) throw new UpstreamError('hybrid：输入框不可见', { code: 'ui_not_ready' });
-    // 先真实移动鼠标到输入框再按下：click 事件与 focus 都由浏览器产生
+    // 先真实移动鼠标到输入框再按下：click 事件与 focus 都由浏览器产生。
+    // 拟人节奏关闭时走快速档，不再人为等待。
+    const fast = !rhythm && !ime;
     await this.#moveTo(box.x, box.y);
-    await sleep(90 + Math.random() * 120, signal);
+    if (!fast) await sleep(90 + Math.random() * 120, signal);
     await this.#mouseClickAt(box.x, box.y);
-    await sleep(50 + Math.random() * 60, signal);
+    if (!fast) await sleep(50 + Math.random() * 60, signal);
 
     const sample = prompt.slice(0, sampleChars);
     const actions = planTyping(sample, { baseMs, rhythm, typoRate, ime });
@@ -1219,11 +1248,9 @@ export class HybridEngine {
 
   async #hover(btn) {
     if (this.#hybrid.mouseCurve === false) {
-      // 旧行为：两段直线 + 固定停留
-      await this.#mouseMove(btn.x - Math.min(20, btn.w / 2), btn.y);
-      await sleep(80);
-      await this.#mouseMove(btn.x, btn.y);
-      await sleep(120);
+      // 快速档：直接移到元素中心，不绕路、不停留
+      await this.#mouseMove(Math.round(btn.x), Math.round(btn.y));
+      this.mouse = { x: Math.round(btn.x), y: Math.round(btn.y), known: true };
       return;
     }
     // 先停在按钮左上方一点（像人先把手移过去），停留后再落到中心
@@ -1236,7 +1263,30 @@ export class HybridEngine {
   }
 
   async #mouseClickAt(x, y) {
+    const curve = this.#hybrid.mouseCurve !== false;
     await this.#moveTo(x, y);
+    // 快速档不做「像人」的预停留/微移；曲线档保留这些细节
+    if (!curve) {
+      await sleep(5);
+      await this.cdp.send('Input.dispatchMouseEvent', {
+        type: 'mousePressed',
+        x: Math.round(x),
+        y: Math.round(y),
+        button: 'left',
+        buttons: 1,
+        clickCount: 1,
+      });
+      await sleep(15);
+      await this.cdp.send('Input.dispatchMouseEvent', {
+        type: 'mouseReleased',
+        x: Math.round(x),
+        y: Math.round(y),
+        button: 'left',
+        buttons: 0,
+        clickCount: 1,
+      });
+      return;
+    }
     await sleep(40 + Math.random() * 80);
     // 按下前 2-3 像素的微调：真人很少一次就停在正中心
     const px = x + (Math.random() * 4 - 2);
@@ -1422,6 +1472,10 @@ export class HybridEngine {
     const ua = requestHeaders['user-agent'] || '';
     const chromeVersion = (ua.match(/Chrome\/([\d.]+)/) || [])[1] || null;
     const headerNames = Object.keys(requestHeaders);
+    const safeValues = {};
+    for (const name of SAFE_HEADER_VALUES) {
+      if (requestHeaders[name]) safeValues[name] = String(requestHeaders[name]).split('?')[0];
+    }
 
     this.lastTrace = {
       url: trace.url,
@@ -1432,6 +1486,7 @@ export class HybridEngine {
       rawOrder: trace.rawOrder || this.lastRequestOrder || null,
       presence,
       cookieNames,
+      safeValues,
       chromeVersion,
       initiator: this.lastInitiator || null,
       source: trace.source,
