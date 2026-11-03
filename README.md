@@ -6,12 +6,17 @@
 
 上下文不打在服务端：每条请求都把历史按 `## System` / `## User` / `## Assistant` / `## Tool_calls` / `## Tool_call_result` 的段落格式拼成一条 prompt，作为一次**全新对话**发给模型。客户端 system 在最上面，自带的协议提示词夹在中间，工具声明和 user/对话历史在后面。
 
-两种引擎，默认 **direct**（Playwright 驱动真实网页）：
+三种引擎，默认 **direct**（Playwright 驱动真实网页）：
 
 | 引擎 | 原理 | 单轮耗时 | 依赖 |
 | --- | --- | --- | --- |
 | browser | Playwright 填输入框，DOM 流式展示 + 抓页面原始补全流 | ~2.2–2.9s | Chromium + 依赖库 |
 | **direct**（默认，更快） | 直接调网页内部接口 + Go 解 PoW | **~1.2–1.9s** | `bin/ds-pow`（Go 编译） |
+| light | 在已登录浏览器的页面里用 `fetch()` 调接口，chunk 回传 Node | ~2–4s | 已登录浏览器 + `bin/ds-pow` |
+
+> 风控严格时优先用 **light**：请求由浏览器网络栈发出，TLS/JA3、HTTP/2、头顺序、cookie 与 `x-hif-*`
+> 都和该浏览器一致；direct 只能对齐 HTTP 语义层，TLS 指纹无法与 Chrome 相同。详见下文「light 引擎」。
+
 
 ```
 ┌──────────────┐  OpenAI HTTP  ┌──────────────┐  HTTPS + PoW   ┌───────────────────┐
@@ -212,6 +217,55 @@ curl -s http://127.0.0.1:8787/v1/messages/count_tokens \
 ```bash
 npm run smoke
 ```
+
+---
+
+## light 引擎（浏览器网络栈传输）
+
+`ENGINE=light`：不驱动页面 UI，也不在 Node 里拼 HTTP 请求，而是**在已登录页面的上下文里调 `fetch()`**：
+
+- Node 负责：PoW 求解（复用 `bin/ds-pow`）、prompt 构建、SSE patch 渲染、工具调用解析
+- 浏览器负责：TLS/JA3、HTTP/2 帧、请求头顺序、cookie、`sec-fetch-*`、`priority`、`accept-encoding`、
+  `x-hif-leim` / `x-hif-dliq`（页面上的风控 SDK 维护在 localStorage 里，每次请求前读取最新值）
+- 流式：`page.exposeFunction` 把 `ReadableStream` 的每个 chunk 回传 Node，复用 `src/direct/stream.mjs`
+  的 `createSseParser` / `applyPatch`，OpenAI 与 Anthropic 两条流式响应不变
+- 完全不碰 DOM：不点按钮、不读页面文本、不做最长文本比对
+
+### 登录态来源（按优先级）
+
+1. `LIGHT_PROFILE_DIR`：用持久化用户目录启动 Chromium（该目录需要已经登录过一次）。
+2. `LIGHT_CDP_URL`：连接一台已经打开 `chat.deepseek.com` 的浏览器，直接复用它的登录态。
+   本机可用 Chrome/Edge 的远程调试端口启动，例如 `--remote-debugging-port=9222`，
+   然后 `LIGHT_CDP_URL=http://127.0.0.1:9222`。未配置时默认尝试 `http://127.0.0.1:9222`。
+3. `LIGHT_STORAGE_STATE`：profile 模式下用 Playwright storageState（cookies + localStorage）注入登录态。
+   这是「拿不到 profile 路径」时的落盘路径：在任意已登录浏览器里连一次 CDP，然后
+   `await context.storageState({ path: 'data/light-state.json' })` 导出（`HttpOnly` cookie 也会包含），
+   再把它交给 `LIGHT_STORAGE_STATE` 即可。文件含凭据，注意权限，且已被 `.gitignore` 覆盖。
+
+```bash
+# 复用已登录浏览器（推荐）
+ENGINE=light LIGHT_CDP_URL=http://127.0.0.1:9222 npm start
+
+# 或持久化用户目录
+ENGINE=light LIGHT_PROFILE_DIR=data/light-profile npm start
+```
+
+单条冒烟（只发一条「你好」，不重试、不连发）：
+
+```bash
+ENGINE=light LIGHT_CDP_URL=http://127.0.0.1:9222 node scripts/smoke-light.mjs
+```
+
+### 事实边界
+
+- light 的请求**确实**由浏览器网络栈发出，因此 TLS/JA3、HTTP/2 帧、头顺序与浏览器一致；
+  日志里的「light 请求指纹（脱敏）」只打印头名与是否存在（cookie 只打印 cookie 名），不打印值。
+- `x-hif-*` 由页面的风控 SDK 维护；light 每次请求前从 `hif_leim_cached` / `hif_dliq_cached`
+  读取当前值。若缓存不存在（页面还没跑过 SDK），请求会不带该头，由服务端判断。
+- 403 / 风控页 / 验证码**一律立即停止**：不重试、不换号，保留脱敏证据（状态码、content-type、
+  是否 HTML、是否验证关键词），不会输出响应正文或任何凭据。
+- 与 browser 引擎的取舍：browser 靠 DOM，慢且受页面改版影响；light 只依赖私有接口协议，
+  更快但仍需页面保持登录。风控严格时把 light 作为默认/生产路径，direct 作为低风险时的快速路径。
 
 ---
 
@@ -473,7 +527,7 @@ npm run auth -- --list      # 查看号池（token 打码）
 
 | 变量 | 默认 | 说明 |
 | --- | --- | --- |
-| `ENGINE` | `direct` | `browser`/ `direct`（需 ds-pow，更快）/ `auto`（有 ds-pow 就直连） |
+| `ENGINE` | `direct` | `browser` / `direct`（需 ds-pow，更快）/ `light`（浏览器网络栈，需已登录浏览器 + ds-pow）/ `auto`（有 ds-pow 就直连） |
 | `POW_BIN` | `bin/ds-pow` | Go PoW 求解器路径 |
 | `DEEPSEEK_USER_TOKEN` | – | 登录态，推荐 `npm run auth` 写文件 |
 | `DEEPSEEK_THINKING` | `always` | `always` / `auto` / `never` |
@@ -504,14 +558,16 @@ npm run auth -- --list      # 查看号池（token 打码）
 
 ```
 src/
-├── engine.mjs            # direct / browser 选择
+├── engine.mjs            # direct / browser / light 选择
 ├── index.mjs             # 启动入口
 ├── server.mjs            # HTTP 路由 + 两个协议的响应编排
 ├── chat-runner.mjs       # 协议无关的执行逻辑（防自造结果 / 超长转附件）
 ├── direct/               # 直连引擎
 │   ├── client.mjs        # 会话 / PoW / 补全
 │   ├── pow.mjs           # Go 求解器封装
-│   └── stream.mjs        # SSE patch 解析
+│   └── stream.mjs        # SSE patch 解析（light 也复用）
+├── light/
+│   └── client.mjs        # 页面内 fetch + exposeFunction 回传 chunk，不碰 DOM
 ├── browser/              # Playwright 引擎：DOM 流式 + 原始补全流截获
 ├── prompt/               # prompt 拼接 / 超长转附件 / DSML 工具协议解析
 │   ├── special.mjs       # 特殊 token 声明（system 提示词）

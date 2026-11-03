@@ -27,10 +27,13 @@ if (!go) {
 }
 
 fs.mkdirSync(path.join(root, 'bin'), { recursive: true });
-const result = spawnSync(go, ['build', '-o', path.join(root, 'bin', 'ds-pow'), './cmd/powd'], {
+// Windows 上 CreateProcess 不会自动补 .exe，Node spawn 无扩展名的 PE 会报 ENOENT
+const binName = process.platform === 'win32' ? 'ds-pow.exe' : 'ds-pow';
+const binPath = path.join(root, 'bin', binName);
+const result = spawnSync(go, ['build', '-o', binPath, './cmd/powd'], {
   cwd: root,
   stdio: 'inherit',
   env: { ...process.env, CGO_ENABLED: '0' },
 });
 if (result.status !== 0) process.exit(result.status ?? 1);
-console.log('✅ 已生成 bin/ds-pow');
+console.log(`✅ 已生成 ${path.relative(root, binPath)}`);

@@ -18,15 +18,18 @@ import crypto from 'node:crypto';
 
 export const DEVICE_PROFILES = {
   // 桌面 Chrome（默认，与 client.mjs 原有 UA 一致）
+  // 2026-11 线上抓包：chat.deepseek.com 客户端运行在 Chromium 156 上
+  // （sec-ch-ua 为 "Not:A-Brand";v="8", "Chromium";v="156", …），
+  // 旧版 131 与新 x-client-version 2.7.0 存在明显版本断层，这里同步到 156。
   'chrome-win': {
-    ua: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+    ua: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/156.0.0.0 Safari/537.36',
     platform: 'Windows',
     mobile: false,
-    uaFullVersion: '131.0.0.0',
+    uaFullVersion: '156.0.0.0',
     brands: [
-      { brand: 'Google Chrome', version: '131' },
-      { brand: 'Chromium', version: '131' },
-      { brand: 'Not_A Brand', version: '24' },
+      { brand: 'Google Chrome', version: '156' },
+      { brand: 'Chromium', version: '156' },
+      { brand: 'Not_A Brand', version: '8' },
     ],
     // 桌面 Chrome 的 sec-ch-ua 用不带空格的形式（Chromium 实际输出就是 Not_A Brand）
     arch: '"x86"',
@@ -34,14 +37,14 @@ export const DEVICE_PROFILES = {
   },
   // Android Chrome（若账号原本来自移动端抓包，用它更自洽）
   'chrome-android': {
-    ua: 'Mozilla/5.0 (Linux; Android 14; 24069RA21C Build/UKQ1.230804.001) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36',
+    ua: 'Mozilla/5.0 (Linux; Android 14; 24069RA21C Build/UKQ1.230804.001) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/156.0.0.0 Mobile Safari/537.36',
     platform: 'Android',
     mobile: true,
-    uaFullVersion: '131.0.0.0',
+    uaFullVersion: '156.0.0.0',
     brands: [
-      { brand: 'Google Chrome', version: '131' },
-      { brand: 'Chromium', version: '131' },
-      { brand: 'Not_A Brand', version: '24' },
+      { brand: 'Google Chrome', version: '156' },
+      { brand: 'Chromium', version: '156' },
+      { brand: 'Not_A Brand', version: '8' },
     ],
     arch: '""',
     bitness: '""',
@@ -106,7 +109,7 @@ export function buildBrowserHeaders({
     // ---- 基础 ----
     accept: '*/*',
     'accept-encoding': 'gzip, deflate, br, zstd',
-    'accept-language': 'zh-CN,zh;q=0.9,en-US;q=0.8,en;q=0.7',
+    'accept-language': 'zh-CN,zh;q=0.9',
     'content-type': 'application/json',
     origin: baseUrl,
     referer: `${baseUrl}/`,
@@ -122,6 +125,8 @@ export function buildBrowserHeaders({
     'sec-fetch-mode': 'cors',
     'sec-fetch-dest': 'empty',
     priority: 'u=1, i',
+    // 线上抓包里浏览器固定带 dnt（Edge/Chrome 默认隐私设置下为 1）
+    dnt: '1',
 
     // ---- DeepSeek 客户端标识 ----
     'x-client-bundle-id': 'com.deepseek.chat',
@@ -130,6 +135,8 @@ export function buildBrowserHeaders({
     'x-client-timezone-offset': String(timezoneOffsetSec),
     'x-client-version': '2.7.0',
     'x-device-id': deviceId,
+    // 桌面端为空值，但真实浏览器会显式发送这个头（抓包中值为空字符串）
+    'x-device-model': '',
   };
 
   if (withAuthorization && token) headers.authorization = `Bearer ${token}`;

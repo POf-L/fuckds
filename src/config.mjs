@@ -100,6 +100,19 @@ export function loadConfig(env = process.env) {
     direct: {
       powBin: path.resolve(ROOT, expandHome(str(env.POW_BIN, 'bin/ds-pow'))),
     },
+    // 轻量浏览器传输引擎（ENGINE=light）：网络请求由浏览器自己发出，
+    // Node 只负责 PoW 求解与 SSE 补丁渲染。
+    light: {
+      // 复用一台已经打开 chat.deepseek.com 的浏览器（Chrome/Edge 远程调试端口）
+      cdpUrl: str(env.LIGHT_CDP_URL, ''),
+      // 或：用持久化用户目录启动 headless Chromium（需先在该目录里登录过一次）
+      profileDir: expandHome(str(env.LIGHT_PROFILE_DIR, '')),
+      // profile 模式可用 Playwright storageState（cookies + localStorage）注入登录态
+      storageState: expandHome(str(env.LIGHT_STORAGE_STATE, '')),
+      headless: bool(env.LIGHT_HEADLESS, true),
+      executablePath: str(env.LIGHT_EXECUTABLE, '') || str(env.CHROMIUM_EXECUTABLE, ''),
+      navigationTimeoutMs: int(env.LIGHT_NAV_TIMEOUT_MS, 60_000),
+    },
     deepseek: {
       baseUrl,
       token,

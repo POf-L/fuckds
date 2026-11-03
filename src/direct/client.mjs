@@ -300,7 +300,12 @@ export class DirectEngine {
         const res = await fetch(`${this.baseUrl}${COMPLETION_PATH}`, {
           method: 'POST',
           signal: controller.signal,
-          headers: { ...this.#headers(account), 'x-ds-pow-response': header },
+          headers: {
+            ...this.#headers(account),
+            'x-ds-pow-response': header,
+            // 线上补全请求的 Referer 是具体会话页（/a/chat/s/<session>），不是站点根路径
+            referer: `${this.baseUrl}/a/chat/s/${sessionId}`,
+          },
           body: JSON.stringify({
             chat_session_id: sessionId,
             parent_message_id: null,

@@ -20,13 +20,19 @@ export class PowSolver {
   #ensureProcess() {
     if (this.proc && !this.proc.killed) return;
 
-    if (!fs.existsSync(this.bin)) {
+    // Windows 的 Go 产物带 .exe 后缀，配置里的默认值仍是 bin/ds-pow，这里做一次兼容
+    let bin = this.bin;
+    if (!fs.existsSync(bin) && process.platform === 'win32' && fs.existsSync(`${bin}.exe`)) {
+      bin = `${bin}.exe`;
+    }
+
+    if (!fs.existsSync(bin)) {
       throw new Error(
         `找不到 PoW 求解器 ${this.bin}，先执行 \`npm run pow:build\`（需要 Go 工具链）`,
       );
     }
 
-    this.proc = spawn(this.bin, [], { stdio: ['pipe', 'pipe', 'pipe'] });
+    this.proc = spawn(bin, [], { stdio: ['pipe', 'pipe', 'pipe'] });
     this.proc.on('exit', (code) => {
       this.log?.warn(`PoW 求解器退出（code ${code}）`);
       this.proc = null;

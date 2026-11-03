@@ -2,16 +2,23 @@ import fs from 'node:fs';
 
 import { DeepSeekWeb } from './browser/driver.mjs';
 import { DirectEngine } from './direct/client.mjs';
+import { LightEngine } from './light/client.mjs';
 
 /**
  * 选择引擎（默认 direct）：
  *   ENGINE=direct  只直连（需要 bin/ds-pow）；条件不满足直接抛错
  *   ENGINE=browser 只走 Playwright（驱动真实网页，不依赖 PoW 求解器）
+ *   ENGINE=light   浏览器网络栈 + 页面内 fetch（不驱动 UI，也不需要 token 文件）
  *   ENGINE=auto    有 Go 求解器就直连，否则回退浏览器
  */
 export function createEngine({ config, logger }) {
   // 未显式指定时默认 direct
   const engine = config.engine ?? 'direct';
+
+  // light 引擎的登录态在浏览器里，不读 data/auth.json，也不需要 token
+  if (engine === 'light') {
+    return new LightEngine({ config, logger: logger.child('light') });
+  }
 
   const wantDirect = engine !== 'browser';
   const binExists = fs.existsSync(config.direct.powBin);
