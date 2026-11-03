@@ -16,6 +16,7 @@
     "auth": "node scripts/auth.mjs",
     "smoke": "node scripts/smoke.mjs",
     "smoke:light": "node scripts/smoke-light.mjs",
+    "smoke:hybrid": "node scripts/smoke-hybrid.mjs",
     "test": "node --test --test-concurrency=1 'test/**/*.test.mjs'",
     "setup:deps": "bash scripts/install-chromium-deps.sh",
     "setup:browser": "playwright install chromium",

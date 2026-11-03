@@ -283,6 +283,68 @@ ENGINE=light LIGHT_CDP_URL=http://127.0.0.1:9222 node scripts/smoke-light.mjs
 
 ---
 
+## hybrid 引擎（真实交互 + 原生补全流）
+
+`ENGINE=hybrid`（默认不启用）：**请求由页面自己发**，Node 只负责抓流和渲染。
+
+- 输入：`Input.dispatchKeyEvent` 逐字输入（`keyDown` 带 `text` + `keyUp`），中文/emoji 用
+  `Input.insertText` 补一对 `rawKeyDown`/`keyUp`，换行用 `Shift+Enter`（普通 Enter 会直接发送）。
+  每一段都会真实产生 `keydown` / `keyup` / `input` 事件，React 受控输入框不需要直接改 `value`。
+- 点击：从元素盒模型取坐标，`Input.dispatchMouseEvent` 走 `mouseMoved` → `mousePressed` →
+  `mouseReleased`，发送前先 hover。
+- 发送前校验：输入框内容与 prompt 完全一致；发送按钮不是停止态、不是 disabled；上一条回复还在
+  生成时先点停止并等恢复，绝不盲点。
+- 抓流：发送前挂 `page.on('response')`，抓页面自身发出的 `/api/v0/chat/completion` **完整 body**
+  （不是首批 chunk），再用 `createSseParser` / `applyPatch` 逐帧回放，OpenAI 与 Anthropic 输出
+  都走原有 chat-runner。**不做 DOM 文本轮询**。
+- 每轮先把「深度思考 / 智能搜索」拨到请求要求的状态、点「开启新对话」保持一次请求一次会话，
+  结束后清空输入框。
+
+```bash
+# 复用已登录浏览器（推荐）
+ENGINE=hybrid HYBRID_CDP_URL=http://127.0.0.1:9222 npm start
+
+# 或持久化用户目录
+ENGINE=hybrid HYBRID_PROFILE_DIR=data/hybrid-profile npm start
+
+# 单条冒烟：只发一条「你好」，打印脱敏的 initiator 与事件计数
+ENGINE=hybrid HYBRID_CDP_URL=http://127.0.0.1:9222 node scripts/smoke-hybrid.mjs
+```
+
+登录态来源与配置与 light 相同（`HYBRID_*` 优先，未配置时回退 `LIGHT_*`）：`HYBRID_PROFILE_DIR` >
+`HYBRID_CDP_URL` > 默认 `http://127.0.0.1:9222`，profile 模式可加 `HYBRID_STORAGE_STATE`。
+另有 `HYBRID_TYPING_DELAY_MS`（逐字停顿，默认 15ms）、`HYBRID_TYPE_SAMPLE_CHARS`（真实键盘事件的
+样本字符数，默认 80，长 prompt 其余部分用 `insertText` 批量注入）、`HYBRID_NEW_CHAT`（默认 true）。
+
+### 与 light 的行为差异
+
+| 信号 | light | hybrid |
+| --- | --- | --- |
+| 请求发起者 | 页面上下文里的 `fetch()` | 页面 UI（真实键鼠事件） |
+| `keydown/keyup/input/click` | 无 | 有（脱敏计数可在 `lastUiTrace` 查看） |
+| 鼠标轨迹 | 无 | 有（移动 + hover + 按下/抬起） |
+| 输入法（IME composition） | 无 | 无（没有真实 IME，`composition*` 事件为 0） |
+| 人类节奏 | 无 | 逐字停顿 + 发送间隔（仍偏机械，可调） |
+| 埋点 / 心跳 | 页面原生的 fetch 不会触发输入埋点 | 输入/点击会触发页面自己的交互埋点 |
+| 依赖 DOM | 不碰 DOM | 依赖输入框/按钮选择器，页面改版会影响 |
+| 流式时间分辨率 | 每个 chunk 实时回传 | body 收完才能读到（Playwright 限制），按帧回放 |
+| 长 prompt | 直接 fetch | 前 80 字符真实输入，其余 `insertText` |
+| 附件 | 支持 `ref_file_ids` | 不支持（返回 400） |
+
+### 事实边界
+
+- `lastTrace` / `lastInitiator` 记录 initiator 类型、页面脚本 URL（去掉查询串）、头名与是否存在、
+  cookie 名与数量、Chrome 版本；**不记录任何头值、cookie 值、token 或签名**。
+- 如果页面改版导致 initiator 抓不到，退化证据是「请求头与页面原生请求一致（同一页面上下文、
+  同一 cookie 集合）」，`smoke-hybrid` 会打印这条告警。
+- 403 / 风控页 / 验证码**立即停止**，不重试、不换号，保留脱敏证据（状态码、content-type、
+  是否 HTML、是否验证关键词）。
+- 复用 `HYBRID_CDP_URL` 时会**在你当前打开的 chat.deepseek.com 标签页上真实输入/点击**，
+  并会清空输入框、开启新对话；不要和手工操作同时使用。想完全隔离就用 `HYBRID_PROFILE_DIR`。
+- 与 light 一样是单账号低频使用：只发必要请求，不并发轰炸。
+
+---
+
 ## 直连协议（direct 引擎）
 
 ```
@@ -541,7 +603,7 @@ npm run auth -- --list      # 查看号池（token 打码）
 
 | 变量 | 默认 | 说明 |
 | --- | --- | --- |
-| `ENGINE` | `direct` | `browser` / `direct`（需 ds-pow，更快）/ `light`（浏览器网络栈，需已登录浏览器 + ds-pow）/ `auto`（有 ds-pow 就直连） |
+| `ENGINE` | `direct` | `browser` / `direct`（需 ds-pow，更快）/ `light`（浏览器网络栈，需已登录浏览器 + ds-pow）/ `hybrid`（真实键鼠驱动页面 UI，需已登录浏览器）/ `auto`（有 ds-pow 就直连） |
 | `POW_BIN` | `bin/ds-pow` | Go PoW 求解器路径 |
 | `DEEPSEEK_USER_TOKEN` | – | 登录态，推荐 `npm run auth` 写文件 |
 | `DEEPSEEK_THINKING` | `always` | `always` / `auto` / `never` |

@@ -116,6 +116,30 @@ export function loadConfig(env = process.env) {
       reconnectMaxAttempts: int(env.LIGHT_RECONNECT_MAX, 5),
       reconnectTotalMs: int(env.LIGHT_RECONNECT_TOTAL_MS, 30_000),
     },
+    // 混合引擎（ENGINE=hybrid）：用真实键鼠事件驱动页面 UI，让页面自己发请求；
+    // 回复仍取自页面原生的 completion SSE，不做 DOM 文本轮询。
+    // 登录态配置复用 light 的 CDP / profile / storageState 思路（HYBRID_* 优先，缺省回退 LIGHT_*）。
+    hybrid: {
+      cdpUrl: str(env.HYBRID_CDP_URL, '') || str(env.LIGHT_CDP_URL, ''),
+      profileDir: expandHome(str(env.HYBRID_PROFILE_DIR, '')) || expandHome(str(env.LIGHT_PROFILE_DIR, '')),
+      storageState:
+        expandHome(str(env.HYBRID_STORAGE_STATE, '')) || expandHome(str(env.LIGHT_STORAGE_STATE, '')),
+      headless: bool(env.HYBRID_HEADLESS, bool(env.LIGHT_HEADLESS, true)),
+      executablePath:
+        str(env.HYBRID_EXECUTABLE, '') ||
+        str(env.LIGHT_EXECUTABLE, '') ||
+        str(env.CHROMIUM_EXECUTABLE, ''),
+      navigationTimeoutMs: int(env.HYBRID_NAV_TIMEOUT_MS, int(env.LIGHT_NAV_TIMEOUT_MS, 60_000)),
+      reconnectMaxAttempts: int(env.HYBRID_RECONNECT_MAX, 5),
+      reconnectTotalMs: int(env.HYBRID_RECONNECT_TOTAL_MS, 30_000),
+      // 逐字输入的字间停顿（毫秒）；0 = 不等待（仍会产生真实的 keydown/keyup）
+      typingDelayMs: int(env.HYBRID_TYPING_DELAY_MS, 15),
+      // 前 N 个字符走真实键盘事件，剩余长 prompt 用 insertText 批量注入（避免 10 万字要打半小时）
+      typeSampleChars: int(env.HYBRID_TYPE_SAMPLE_CHARS, 80),
+      // 每轮是否先点「新对话」（保持「一条请求 = 一次全新对话」的语义）
+      newChat: bool(env.HYBRID_NEW_CHAT, true),
+      // 两次发送之间的最小间隔复用 runtime.sendIntervalMs
+    },
     deepseek: {
       baseUrl,
       token,

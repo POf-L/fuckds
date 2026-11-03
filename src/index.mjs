@@ -34,8 +34,8 @@ server.listen(config.server.port, config.server.host, () => {
   logger.info(`  健康检查   ${base}/healthz`);
   logger.info(
     `  登录态     ${
-      config.engine === 'light'
-        ? '浏览器内登录态（light 引擎）'
+      config.engine === 'light' || config.engine === 'hybrid'
+        ? `浏览器内登录态（${config.engine} 引擎）`
         : config.deepseek.tokens.length
           ? `已配置 ✅ 号池 ${config.deepseek.tokens.length} 个`
           : '未配置 ❌（npm run auth -- <userToken>）'
