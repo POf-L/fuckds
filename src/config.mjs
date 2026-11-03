@@ -112,6 +112,9 @@ export function loadConfig(env = process.env) {
       headless: bool(env.LIGHT_HEADLESS, true),
       executablePath: str(env.LIGHT_EXECUTABLE, '') || str(env.CHROMIUM_EXECUTABLE, ''),
       navigationTimeoutMs: int(env.LIGHT_NAV_TIMEOUT_MS, 60_000),
+      // 自动重连：最大尝试次数与总时限（指数退避，避免高频重连）
+      reconnectMaxAttempts: int(env.LIGHT_RECONNECT_MAX, 5),
+      reconnectTotalMs: int(env.LIGHT_RECONNECT_TOTAL_MS, 30_000),
     },
     deepseek: {
       baseUrl,

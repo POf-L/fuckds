@@ -14,6 +14,7 @@ import {
 } from '../errors.mjs';
 import { PowSolver } from '../direct/pow.mjs';
 import { applyPatch, createSseParser, createStreamState } from '../direct/stream.mjs';
+import { sleep } from '../util.mjs';
 
 const COMPLETION_PATH = '/api/v0/chat/completion';
 const SESSION_PATH = '/api/v0/chat_session/create';
@@ -54,6 +55,8 @@ export class LightEngine {
     this.persistent = false;
     this.launching = null;
     this.closed = false;
+    this.contextClosed = false;
+    this.everStarted = false;
     this.inflight = 0;
     this.bindings = new WeakSet();
     this.calls = new Map();
@@ -67,53 +70,137 @@ export class LightEngine {
     /** 最近一次 403/风控/验证码的脱敏证据 */
     this.lastEvidence = null;
     this.identityCache = null;
+    /** 登录态失效标记：置位后每次请求都会明确报「需要重新登录」，不做静默重试 */
+    this.loginRequired = false;
+    /** 最近一次自动重连的统计信息（脱敏） */
+    this.reconnect = {
+      attempts: 0,
+      lastAt: null,
+      lastReason: null,
+      lastError: null,
+      totalMs: 0,
+    };
   }
 
   /* ------------------------------------------------------------------ *
    * 生命周期
    * ------------------------------------------------------------------ */
 
-  async ensureStarted() {
+  /** 页面/上下文是否还需要重建（不发起网络请求，只做本地状态判断） */
+  #needsLaunch() {
+    if (this.contextClosed) return true;
+    if (!this.persistent && this.browser && !this.browser.isConnected?.()) return true;
+    if (!this.page || this.page.isClosed()) return true;
+    let url = '';
+    try {
+      url = this.page.url();
+    } catch {
+      return true;
+    }
+    if (/\/sign_in|\/login/i.test(url)) {
+      this.loginRequired = true;
+      throw new AuthExpiredError('light 引擎：页面已跳到登录页，需要重新登录 chat.deepseek.com');
+    }
+    return !/chat\.deepseek\.com/.test(url);
+  }
+
+  async ensureStarted(reason = 'ensure') {
     if (this.closed) throw new UpstreamError('服务正在关闭');
-    if (this.page && !this.page.isClosed()) return;
+    if (!this.#needsLaunch()) return;
     if (this.launching) return this.launching;
-    this.launching = this.#launch().finally(() => {
+    this.launching = this.#launch(reason).finally(() => {
       this.launching = null;
     });
     return this.launching;
   }
 
-  async #launch() {
+  async #launch(reason = 'ensure') {
     const light = this.config.light || {};
     const profileDir = light.profileDir;
     const cdpUrl = light.cdpUrl || DEFAULT_CDP_URL;
+    const recover = reason !== 'initial' && this.everStarted;
+    const startedAt = Date.now();
 
     if (profileDir) {
-      await this.#launchPersistent(profileDir, light);
+      await this.#ensurePersistent(profileDir, light);
     } else {
-      await this.#connectCdp(cdpUrl);
+      await this.#ensureCdp(cdpUrl);
     }
 
-    const page = this.#findPage() || (await this.#openPage());
+    const page = await this.#ensurePage();
     this.page = page;
     await this.#bindPage(page);
+    this.everStarted = true;
+
+    if (recover) {
+      this.reconnect.lastAt = new Date().toISOString();
+      this.reconnect.lastReason = reason;
+      this.reconnect.totalMs = Date.now() - startedAt;
+      this.log.warn('light 自动重连成功（浏览器/页面已恢复，脱敏）', { ...this.reconnect });
+    }
 
     const identity = await this.#identity();
     this.identityCache = identity;
     if (!identity.signedIn) {
+      this.loginRequired = true;
       throw new AuthExpiredError(
-        'light 引擎：浏览器里没有 userToken。请先在同一浏览器（CDP 端口或 LIGHT_PROFILE_DIR）登录 https://chat.deepseek.com',
+        'light 引擎：登录态已失效（浏览器里没有 userToken），需要重新登录 https://chat.deepseek.com',
       );
     }
+    this.loginRequired = false;
+
     this.log.info('light 引擎已就绪', {
       transport: profileDir ? 'persistent-profile' : 'cdp',
+      recovered: recover,
       deviceId: Boolean(identity.deviceId),
       hifLeim: Boolean(identity.hifLeim),
       hifDliq: Boolean(identity.hifDliq),
     });
   }
 
-  async #launchPersistent(profileDir, light) {
+  /** 指数退避 + 最大次数/总时限；只重建浏览器，不碰业务请求 */
+  async #withBackoff(label, fn) {
+    const maxAttempts = Math.max(1, this.config.light.reconnectMaxAttempts ?? 5);
+    const totalMs = Math.max(1_000, this.config.light.reconnectTotalMs ?? 30_000);
+    const startedAt = Date.now();
+    let attempt = 0;
+    let delay = 500;
+    for (;;) {
+      attempt += 1;
+      this.reconnect.attempts = attempt;
+      try {
+        const value = await fn();
+        this.reconnect.lastError = null;
+        return value;
+      } catch (err) {
+        this.reconnect.lastError = err.message;
+        if (attempt >= maxAttempts || Date.now() - startedAt >= totalMs) {
+          throw new UpstreamError(
+            `light 重连失败（${label}，${attempt} 次 / ${Date.now() - startedAt}ms）：${err.message}`,
+            { code: 'light_reconnect_failed' },
+          );
+        }
+        const wait = Math.min(delay, 8_000) + Math.floor(Math.random() * 200);
+        this.log.warn(`light ${label} 失败，${wait}ms 后重试`, { attempt, message: err.message });
+        await sleep(wait);
+        delay = Math.min(delay * 2, 8_000);
+      }
+    }
+  }
+
+  async #ensurePersistent(profileDir, light) {
+    // 自管实例：上下文还在且浏览器进程未断开才复用，否则重启一个新实例
+    let browserAlive = true;
+    try {
+      browserAlive = this.context?.browser?.()?.isConnected?.() !== false;
+    } catch {
+      browserAlive = false;
+    }
+    if (this.context && !this.contextClosed && browserAlive) return;
+    if (this.context) await this.context.close().catch(() => {});
+    this.context = null;
+    this.contextClosed = false;
+
     fs.mkdirSync(profileDir, { recursive: true });
     const state = light.storageState;
     if (state && !fs.existsSync(state)) {
@@ -124,39 +211,100 @@ export class LightEngine {
       headless: light.headless,
       storageState: Boolean(state),
     });
-    this.context = await chromium.launchPersistentContext(profileDir, {
-      headless: light.headless,
-      executablePath: light.executablePath || undefined,
-      storageState: state || undefined,
-      viewport: this.config.browser.viewport,
-      locale: this.config.browser.locale,
-      timezoneId: process.env.TZ || 'Asia/Shanghai',
-      args: [
-        '--no-sandbox',
-        '--disable-dev-shm-usage',
-        '--disable-gpu',
-        '--disable-blink-features=AutomationControlled',
-        '--no-first-run',
-        '--no-default-browser-check',
-      ],
-    });
+
+    const context = await this.#withBackoff('persistent-launch', () =>
+      chromium.launchPersistentContext(profileDir, {
+        headless: light.headless,
+        executablePath: light.executablePath || undefined,
+        storageState: state || undefined,
+        viewport: this.config.browser.viewport,
+        locale: this.config.browser.locale,
+        timezoneId: process.env.TZ || 'Asia/Shanghai',
+        args: [
+          '--no-sandbox',
+          '--disable-dev-shm-usage',
+          '--disable-gpu',
+          '--disable-blink-features=AutomationControlled',
+          '--no-first-run',
+          '--no-default-browser-check',
+        ],
+      }),
+    );
+    this.context = context;
     this.persistent = true;
+    context.on('close', () => {
+      this.contextClosed = true;
+      this.page = null;
+      if (!this.closed) this.log.warn('light：持久化浏览器已退出，下次请求会重启实例');
+    });
   }
 
-  async #connectCdp(cdpUrl) {
+  async #ensureCdp(cdpUrl) {
+    if (this.browser?.isConnected?.() && this.context && !this.contextClosed) return;
+    const old = this.browser;
+    if (old) await old.close().catch(() => {});
+    this.browser = null;
+    this.context = null;
+    this.contextClosed = false;
+
     this.log.info('连接已登录浏览器（light）…', { cdpUrl });
-    this.browser = await chromium.connectOverCDP(cdpUrl);
-    this.browser.on('disconnected', () => {
-      this.log.warn('light：浏览器连接已断开');
-      this.page = null;
+    const connected = await this.#withBackoff('cdp-connect', async () => {
+      const browser = await chromium.connectOverCDP(cdpUrl);
+      browser.on('disconnected', () => {
+        if (this.browser !== browser) return;
+        this.browser = null;
+        this.context = null;
+        this.page = null;
+        if (!this.closed) this.log.warn('light：CDP 连接已断开，下次请求会按退避重连');
+      });
+      const context = browser.contexts()[0] || (await browser.newContext());
+      context.on('close', () => {
+        if (this.context !== context) return;
+        this.contextClosed = true;
+        this.page = null;
+        if (!this.closed) this.log.warn('light：浏览器上下文已关闭，下次请求会重连');
+      });
+      return { browser, context };
     });
-    this.context = this.browser.contexts()[0] || (await this.browser.newContext());
+    this.browser = connected.browser;
+    this.context = connected.context;
     // 复用 CDP 时不改窗口大小、不改 UA：保持真实浏览器原样
   }
 
   #findPage() {
     const pages = this.context?.pages?.() || [];
-    return pages.find((p) => !p.isClosed() && /chat\.deepseek\.com/.test(p.url())) || null;
+    return (
+      pages.find((p) => {
+        if (p.isClosed()) return false;
+        const url = p.url();
+        return /chat\.deepseek\.com/.test(url) && !/\/sign_in|\/login/i.test(url);
+      }) || null
+    );
+  }
+
+  async #ensurePage() {
+    const existing = this.#findPage();
+    if (existing) return existing;
+
+    // 自己打开的页面 URL 失效时允许导航回去；复用的用户页面不劫持，改为新开一页
+    if (this.page && !this.page.isClosed() && this.ownsPage) {
+      try {
+        await this.#navigate(this.page);
+        return this.page;
+      } catch (err) {
+        this.log.warn('light：原页面导航失败，改为新开页面', { message: err.message });
+        await this.page.close().catch(() => {});
+        this.page = null;
+      }
+    }
+    return this.#openPage();
+  }
+
+  async #navigate(page) {
+    await page.goto(`${this.baseUrl}/`, {
+      waitUntil: 'domcontentloaded',
+      timeout: this.config.light.navigationTimeoutMs,
+    });
   }
 
   async #openPage() {
@@ -164,16 +312,24 @@ export class LightEngine {
     const page = await this.context.newPage();
     this.ownsPage = true;
     page.setDefaultTimeout(30_000);
-    await page.goto(`${this.baseUrl}/`, {
-      waitUntil: 'domcontentloaded',
-      timeout: this.config.light.navigationTimeoutMs,
-    });
+    await this.#navigate(page);
     return page;
   }
 
   async #bindPage(page) {
     if (this.bindings.has(page)) return;
     this.bindings.add(page);
+
+    page.on('close', () => {
+      if (this.page !== page) return;
+      this.page = null;
+      if (!this.closed) this.log.warn('light：页面已关闭，下次请求会自动重连');
+    });
+    page.on('crash', () => {
+      if (this.page !== page) return;
+      this.page = null;
+      if (!this.closed) this.log.warn('light：页面崩溃，下次请求会自动重连');
+    });
 
     // 页面 SDK 只做「在浏览器里读登录态 + 发 fetch」，不碰 DOM、不点按钮
     await page.evaluate(installLightSdk);
@@ -268,13 +424,34 @@ export class LightEngine {
   }
 
   async #identity() {
-    const id = await this.page.evaluate(() => window.__LIGHT_SDK__.identity());
+    if (!this.page || this.page.isClosed()) {
+      throw new UpstreamError('light：页面已关闭', { code: 'light_page_gone' });
+    }
+    let id;
+    try {
+      id = await this.page.evaluate(() => window.__LIGHT_SDK__.identity());
+    } catch (err) {
+      // 页面崩溃/导航失败：标记为不可用，下一次 ensureStarted 会重连
+      this.page = null;
+      throw new UpstreamError(`light：页面读取登录态失败：${err.message}`, { code: 'light_page_failed' });
+    }
     this.identityCache = id;
+    this.loginRequired = !id.signedIn;
     return id;
   }
 
+  /** 每次请求前确认登录态键还在；失效就明确报错，不静默重试、不自动登录 */
+  async #assertSignedIn() {
+    const id = await this.#identity();
+    if (!id.signedIn) {
+      throw new AuthExpiredError(
+        'light 引擎：登录态已失效（userToken 不存在或页面已退出登录），需要重新登录 chat.deepseek.com',
+      );
+    }
+  }
+
   async warmUp() {
-    await this.ensureStarted();
+    await this.ensureStarted('initial');
     const identity = await this.#identity();
     this.log.debug('light 预热完成', {
       signedIn: identity.signedIn,
@@ -283,15 +460,43 @@ export class LightEngine {
     });
   }
 
-  status() {
+  /** 健康状态出口：browser 是否在线、页面是否可用、最近一次重连时间/原因 */
+  health() {
+    let pageUrl = null;
+    if (this.page && !this.page.isClosed()) {
+      try {
+        pageUrl = this.page.url();
+      } catch {
+        pageUrl = null;
+      }
+    }
+    const browserOnline = this.persistent
+      ? Boolean(this.context && !this.contextClosed)
+      : Boolean(this.browser?.isConnected?.());
+    const pageReady = Boolean(
+      pageUrl && /chat\.deepseek\.com/.test(pageUrl) && !/\/sign_in|\/login/i.test(pageUrl),
+    );
     return {
       engine: 'light',
-      browser: Boolean(this.browser?.isConnected?.() ?? this.context),
-      pages: this.page && !this.page.isClosed() ? 1 : 0,
+      online: browserOnline && pageReady && !this.loginRequired,
+      browserOnline,
+      pageReady,
+      pageUrl,
+      loginRequired: this.loginRequired,
+      transport: this.config.light?.profileDir ? 'persistent-profile' : 'cdp',
+      reconnect: { ...this.reconnect },
+    };
+  }
+
+  status() {
+    const health = this.health();
+    return {
+      ...health,
+      browser: health.browserOnline,
+      pages: health.pageReady ? 1 : 0,
       busy: this.inflight,
       queued: 0,
       token: Boolean(this.identityCache?.signedIn),
-      transport: this.persistent ? 'persistent-profile' : 'cdp',
     };
   }
 
@@ -305,6 +510,7 @@ export class LightEngine {
     await this.browser?.close().catch(() => {});
     this.context = null;
     this.browser = null;
+    this.contextClosed = true;
     this.pow.close();
   }
 
@@ -319,12 +525,27 @@ export class LightEngine {
       );
     }
     await this.ensureStarted();
+    await this.#assertSignedIn();
 
     this.inflight += 1;
     const startedAt = Date.now();
     try {
-      const sessionId = await this.#createSession();
-      let powHeader = await this.#powHeader(COMPLETION_PATH);
+      let sessionId;
+      let powHeader;
+      try {
+        sessionId = await this.#createSession();
+        powHeader = await this.#powHeader(COMPLETION_PATH);
+      } catch (err) {
+        // 页面在请求过程中被关闭/崩溃：只允许一次基础设施级重连重试
+        if (err?.code === 'light_page_gone' || err?.code === 'light_page_failed') {
+          this.log.warn('light：页面在执行中丢失，重连后重试一次', { message: err.message });
+          await this.ensureStarted('page_lost');
+          sessionId = await this.#createSession();
+          powHeader = await this.#powHeader(COMPLETION_PATH);
+        } else {
+          throw err;
+        }
+      }
       let powRetried = false;
 
       const requestBody = {
@@ -438,7 +659,8 @@ export class LightEngine {
           if (res.status === 403 && (/text\/html/i.test(contentType) || /验证|风控|captcha|challenge/i.test(text))) {
             throw new CaptchaError('DeepSeek 返回了风控/验证码页面（light），已停止且不再重试');
           }
-          throw new AuthExpiredError('light：登录态被上游拒绝（401/403），请在浏览器里重新登录');
+          this.loginRequired = true;
+          throw new AuthExpiredError('light：登录态被上游拒绝（401/403），需要重新登录 chat.deepseek.com');
         }
         if (res?.status === 429 || /频繁|rate limit/i.test(message)) {
           this.#recordEvidence({ step: 'completion', status: res?.status ?? 0, contentType, message, text });
@@ -662,10 +884,20 @@ export class LightEngine {
    * ------------------------------------------------------------------ */
 
   async #callJson(path, body, headers, referrer) {
-    const res = await this.page.evaluate(
-      (payload) => window.__LIGHT_SDK__.json(payload.path, payload.body, payload.headers, payload.referrer),
-      { path, body, headers, referrer },
-    );
+    let res;
+    try {
+      res = await this.page.evaluate(
+        (payload) => window.__LIGHT_SDK__.json(payload.path, payload.body, payload.headers, payload.referrer),
+        { path, body, headers, referrer },
+      );
+    } catch (err) {
+      const gone = this.page?.isClosed?.() || /closed|Target closed|crash/i.test(err.message);
+      if (gone) {
+        this.page = null;
+        throw new UpstreamError(`light：页面已不可用：${err.message}`, { code: 'light_page_gone' });
+      }
+      throw new UpstreamError(`light：${path} 执行失败：${err.message}`, { code: 'light_page_failed' });
+    }
     if (res.status === 401 || res.status === 403) this.#throwHttp(res, path);
     return res;
   }
@@ -682,7 +914,8 @@ export class LightEngine {
       throw new CaptchaError('DeepSeek 返回了风控/验证码页面（light），已停止且不再重试');
     }
     if (res?.status === 401 || res?.status === 403) {
-      throw new AuthExpiredError('light：登录态被上游拒绝（401/403），请在浏览器里重新登录');
+      this.loginRequired = true;
+      throw new AuthExpiredError('light：登录态被上游拒绝（401/403），需要重新登录 chat.deepseek.com');
     }
     if (res?.status === 429 || /频繁|rate limit/i.test(message)) throw new RateLimitError(message);
     throw new UpstreamError(`light ${step} 失败：${message}`, { code: 'api_error' });

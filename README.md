@@ -256,6 +256,20 @@ ENGINE=light LIGHT_PROFILE_DIR=data/light-profile npm start
 ENGINE=light LIGHT_CDP_URL=http://127.0.0.1:9222 node scripts/smoke-light.mjs
 ```
 
+### 存活守护与自动重连
+
+- 每次请求前会检查：CDP 连接是否还在、页面是否关闭/崩溃、页面 URL 是否仍是 `chat.deepseek.com`
+  （跳到 `/sign_in` 视为登录失效）、`userToken` 是否还在。
+- CDP 断开 / 页面崩溃 / 上下文关闭：按指数退避（500ms 起、上限 8s）重连，受
+  `LIGHT_RECONNECT_MAX`（默认 5 次）与 `LIGHT_RECONNECT_TOTAL_MS`（默认 30s）约束；
+  重连后重新绑定页面、复用 `LIGHT_STORAGE_STATE`（若配置）并恢复页面上下文。
+- `LIGHT_PROFILE_DIR` 自管模式：浏览器进程退出后会自动启动一个新实例（profile 目录复用）。
+- 登录态失效（`userToken` 消失、页面跳登录页、上游 401/403）**不静默重试**，直接抛
+  “需要重新登录 chat.deepseek.com”，不会自动登录、不换号。
+- `GET /healthz` 的 light 字段：`browserOnline` / `pageReady` / `pageUrl` / `loginRequired` /
+  `transport`（`cdp` 或 `persistent-profile`）/ `reconnect`（`attempts`、`lastAt`、`lastReason`、
+  `lastError`、`totalMs`）。
+
 ### 事实边界
 
 - light 的请求**确实**由浏览器网络栈发出，因此 TLS/JA3、HTTP/2 帧、头顺序与浏览器一致；
