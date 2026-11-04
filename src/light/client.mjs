@@ -12,6 +12,7 @@ import {
   TimeoutError,
   UpstreamError,
 } from '../errors.mjs';
+import { launchOrReusePersistent } from '../browser/profile-lock.mjs';
 import { PowSolver } from '../direct/pow.mjs';
 import { applyPatch, createSseParser, createStreamState } from '../direct/stream.mjs';
 import { sleep } from '../util.mjs';
@@ -212,26 +213,36 @@ export class LightEngine {
       storageState: Boolean(state),
     });
 
-    const context = await this.#withBackoff('persistent-launch', () =>
-      chromium.launchPersistentContext(profileDir, {
-        headless: light.headless,
-        executablePath: light.executablePath || undefined,
-        storageState: state || undefined,
-        viewport: this.config.browser.viewport,
-        locale: this.config.browser.locale,
-        timezoneId: process.env.TZ || 'Asia/Shanghai',
-        args: [
-          '--no-sandbox',
-          '--disable-dev-shm-usage',
-          '--disable-gpu',
-          '--disable-blink-features=AutomationControlled',
-          '--no-first-run',
-          '--no-default-browser-check',
-        ],
-      }),
-    );
+    const launched = await launchOrReusePersistent({
+      chromium,
+      profileDir,
+      log: this.log,
+      launch: (extraArgs) => this.#withBackoff('persistent-launch', () =>
+        chromium.launchPersistentContext(profileDir, {
+          headless: light.headless,
+          executablePath: light.executablePath || undefined,
+          storageState: state || undefined,
+          viewport: this.config.browser.viewport,
+          locale: this.config.browser.locale,
+          timezoneId: process.env.TZ || 'Asia/Shanghai',
+          args: [
+            '--no-sandbox',
+            '--disable-dev-shm-usage',
+            '--disable-gpu',
+            '--disable-blink-features=AutomationControlled',
+            '--no-first-run',
+            '--no-default-browser-check',
+            ...extraArgs,
+          ],
+        }),
+      ),
+    });
+    const context = launched.context;
     this.context = context;
-    this.persistent = true;
+    // 复用的实例不归本引擎所有：关闭时只断开 CDP
+    this.persistent = !launched.reused;
+    this.profileShared = launched.reused;
+    if (launched.reused) this.browser = launched.browser;
     context.on('close', () => {
       this.contextClosed = true;
       this.page = null;

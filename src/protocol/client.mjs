@@ -3,6 +3,7 @@ import path from 'node:path';
 
 import { DirectEngine } from '../direct/client.mjs';
 import { AuthExpiredError } from '../errors.mjs';
+import { liveProfilePort } from '../browser/profile-lock.mjs';
 import { fingerprintOf } from '../direct/account-pool.mjs';
 import { HybridEngine } from '../hybrid/client.mjs';
 import { evaluateCredentialState, isDispatchableState } from '../auth/credential-state.mjs';
@@ -61,6 +62,7 @@ export class ProtocolEngine {
     this.lastReason = null;
     this.lastRefreshAt = null;
     this.lastHarvestMs = null;
+    this.lastLiveSyncAt = 0;
   }
 
   async ensureStarted() {
@@ -204,6 +206,60 @@ export class ProtocolEngine {
     throw err;
   }
 
+  /**
+   * 从“已经在运行的 profile 实例”读当前 cookie/token/hif。
+   * 没有实例就返回 null —— 绝不为了刷新凭据自己启动第二个浏览器。
+   */
+  async #harvestLiveCredentials() {
+    const profileDir = this.config.hybrid?.profileDir;
+    if (!profileDir || !(await liveProfilePort(profileDir))) return null;
+    try {
+      return await harvestCredentials({
+        config: this.config,
+        logger: this.log,
+        reuseOnly: true,
+        waitMs: 0,
+      });
+    } catch (err) {
+      this.log.warn?.('从活的 profile 同步凭据失败，沿用最近快照', { message: err.message });
+      return null;
+    }
+  }
+
+  /** 把活 profile 的最新凭据同步到内存（同 token 只更新 cookie/hif，不重建引擎） */
+  #applyLiveCredentials(creds) {
+    const fingerprint = fingerprintOf(creds.userToken);
+    const found = this.accounts.find((account) => account.fingerprint === fingerprint);
+    if (found) {
+      found.creds = creds;
+      if (found.engine?.config?.deepseek) {
+        found.engine.config.deepseek.protocolExtras = buildProtocolExtras(creds);
+      }
+      this.credentialSource = 'live-profile';
+      this.log.info?.('已从活的 profile 同步凭据（cookie/hif 更新，未启动浏览器）');
+      return;
+    }
+    // token 变了（用户在同一个 profile 里重新登录过一次）：落盘并重建引擎
+    const old = this.accounts.map((account) => account.engine);
+    const file = this.#saveCredential(creds);
+    this.#buildEngines([{ creds, file }]);
+    this.credentialSource = 'live-profile';
+    this.log.info?.('活的 profile 里是另一个登录态，已切换账号');
+    for (const engine of old) void engine?.close?.().catch?.(() => {});
+  }
+
+  /** 每 60s 最多同步一次，避免每个请求都去读页面 */
+  async #syncFromLiveProfile() {
+    if (Date.now() - this.lastLiveSyncAt < 60_000) return false;
+    const profileDir = this.config.hybrid?.profileDir;
+    if (!profileDir || !(await liveProfilePort(profileDir))) return false;
+    this.lastLiveSyncAt = Date.now();
+    const creds = await this.#harvestLiveCredentials();
+    if (!creds) return false;
+    this.#applyLiveCredentials(creds);
+    return true;
+  }
+
   async #loadOrHarvest(force) {
     let loaded = force ? [] : this.#loadAllCredentials();
     if (loaded.length) {
@@ -264,8 +320,10 @@ export class ProtocolEngine {
   }
 
   async #refreshCredentials() {
-    // 先过策略闸门，再关旧引擎：避免“已经关掉账号、浏览器又起不来”的半死状态
-    this.#assertBrowserRefreshAllowed('auth-refresh');
+    // 第一优先：从“已经在运行的 profile 实例”重新读（不启动浏览器）。
+    // 只有没有活实例时，才需要用户显式授权打开浏览器（默认拒绝）。
+    const live = await this.#harvestLiveCredentials();
+    if (!live) this.#assertBrowserRefreshAllowed('auth-refresh');
     this.log.warn('协议通道：凭据疑似失效，从浏览器 profile 刷新一次', {
       reason: this.lastReason,
       source: this.credentialSource,
@@ -275,7 +333,8 @@ export class ProtocolEngine {
     this.inner = null;
     for (const engine of old) await engine?.close?.().catch?.(() => {});
     this.lastRefreshAt = Date.now();
-    await this.#loadOrHarvest(true);
+    if (live) this.#applyLiveCredentials(live);
+    else await this.#loadOrHarvest(true);
     this.degradations += 1;
   }
 
@@ -286,6 +345,8 @@ export class ProtocolEngine {
     for (;;) {
       try {
         await this.ensureStarted();
+        // 活 profile 优先：每 60s 从已运行的实例同步 cookie/hif（绝不为此新开浏览器）
+        await this.#syncFromLiveProfile();
         const preferred = args.session?.accountFingerprint ?? args.accountFingerprint ?? null;
         const selected = this.#selectAccount(preferred);
         const engine = selected?.engine || this.inner;
@@ -314,10 +375,19 @@ export class ProtocolEngine {
           }
         }
         if (this.config.protocol.fallbackToHybrid === false) {
-          // 明确告诉客户端「是凭据失效」，不要伪装成上游 5xx
-          throw err.name === 'AuthExpiredError' ? err : new AuthExpiredError(`协议凭据失效：${err.message}`);
+          // 只有「已经有活的 profile 实例」才允许经 CDP 降级；否则明确报凭据失效，
+          // 绝不为了降级自己启动第二个浏览器（会顶掉用户登录态）。
+          const livePort = await liveProfilePort(this.config.hybrid?.profileDir);
+          if (!livePort) {
+            throw err.name === 'AuthExpiredError' ? err : new AuthExpiredError(`协议凭据失效：${err.message}`);
+          }
+          this.log.warn('协议凭据失效，但 profile 实例已在运行：经 CDP 降级到 hybrid（不新开浏览器）', {
+            port: livePort,
+            reason: this.lastReason,
+          });
+        } else {
+          this.log.warn('协议通道＋刷新凭据均失败，降级到 hybrid 全浏览器', { reason: this.lastReason });
         }
-        this.log.warn('协议通道＋刷新凭据均失败，降级到 hybrid 全浏览器', { reason: this.lastReason });
         this.layer = 'hybrid';
         this.degradations += 1;
         this.hybrid = new HybridEngine({ config: this.config, logger: this.log.child('hybrid') });

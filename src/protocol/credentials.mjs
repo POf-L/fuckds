@@ -3,6 +3,7 @@ import path from 'node:path';
 import { chromium } from 'playwright';
 
 import { hybridLaunchArgs } from '../hybrid/client.mjs';
+import { launchOrReusePersistent, liveProfilePort } from '../browser/profile-lock.mjs';
 import { looksLikeLoginToken } from '../auth/credential-state.mjs';
 
 /**
@@ -155,13 +156,28 @@ export async function extractCredentialsFromContext(ctx, page, startedAt = Date.
   return record;
 }
 
-export async function harvestCredentials({ config, logger, waitMs = config.protocol?.harvestWaitMs ?? 2500 }) {
+export async function harvestCredentials({
+  config,
+  logger,
+  waitMs = config.protocol?.harvestWaitMs ?? 2500,
+  reuseOnly = false,
+}) {
   const startedAt = Date.now();
-  const ctx = await chromium.launchPersistentContext(config.hybrid.profileDir, {
-    headless: false,
-    channel: config.hybrid.channel || undefined,
-    args: hybridLaunchArgs(),
+  const profileDir = config.hybrid.profileDir;
+  // reuseOnly：只允许从“已经在跑的 profile 实例”读，读不到就返回 null（绝不新开浏览器）
+  if (reuseOnly && !(await liveProfilePort(profileDir))) return null;
+  const launched = await launchOrReusePersistent({
+    chromium,
+    profileDir,
+    log: logger,
+    launch: (extraArgs) =>
+      chromium.launchPersistentContext(profileDir, {
+        headless: false,
+        channel: config.hybrid.channel || undefined,
+        args: [...hybridLaunchArgs(), ...extraArgs],
+      }),
   });
+  const ctx = launched.context;
   const page = ctx.pages()[0] || (await ctx.newPage());
   try {
     await page.goto('https://chat.deepseek.com/', { waitUntil: 'domcontentloaded' });
@@ -177,6 +193,11 @@ export async function harvestCredentials({ config, logger, waitMs = config.proto
     logger?.info?.('协议凭据已采集', credentialSummary(record));
     return record;
   } finally {
-    await ctx.close().catch(() => {});
+    if (launched.reused) {
+      // 只断开 CDP，不关掉别人（服务/登录窗口）的浏览器
+      await launched.browser?.close?.().catch(() => {});
+    } else {
+      await ctx.close().catch(() => {});
+    }
   }
 }

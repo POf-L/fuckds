@@ -18,6 +18,7 @@
     "smoke:light": "node scripts/smoke-light.mjs",
     "smoke:hybrid": "node scripts/smoke-hybrid.mjs",
     "auth:hybrid": "node scripts/login-hybrid.mjs",
+    "profile:status": "node scripts/profile-status.mjs",
     "measure:hybrid": "node scripts/measure-hybrid.mjs",
     "measure:protocol": "node scripts/measure-protocol.mjs",
     "test": "node --test --test-concurrency=1",

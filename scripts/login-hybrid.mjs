@@ -16,6 +16,7 @@ import path from 'node:path';
 import { chromium } from 'playwright';
 
 import { CONFIG_ROOT, loadConfig } from '../src/config.mjs';
+import { launchOrReusePersistent } from '../src/browser/profile-lock.mjs';
 import { fingerprintOf } from '../src/direct/account-pool.mjs';
 import {
   extractCredentialsFromContext,
@@ -33,27 +34,47 @@ const executablePath = config.hybrid.executablePath;
 
 fs.mkdirSync(profileDir, { recursive: true });
 
+/**
+ * 单实例：服务正在用同一个 profile 时，本脚本只走 CDP 复用，
+ * 不会起第二个 Chromium（第二个实例会把已登录会话顶掉，实测 2026-11-05）。
+ */
 async function launch(storageState) {
   const options = {
     headless: false,
     viewport: config.browser.viewport,
     locale: config.browser.locale,
     timezoneId: process.env.TZ || 'Asia/Shanghai',
-    args: [
-      '--disable-gpu',
-      '--no-first-run',
-      '--no-default-browser-check',
-      '--disable-blink-features=AutomationControlled',
-    ],
     storageState: storageState || undefined,
   };
-  if (executablePath) return chromium.launchPersistentContext(profileDir, { ...options, executablePath });
-  try {
-    return await chromium.launchPersistentContext(profileDir, { ...options, channel });
-  } catch (err) {
-    console.warn(`channel=${channel} 启动失败，回退自带 Chromium：${err.message}`);
-    return chromium.launchPersistentContext(profileDir, options);
-  }
+  return launchOrReusePersistent({
+    chromium,
+    profileDir,
+    log: { info: (m, meta) => console.log(m, meta ? JSON.stringify(meta) : ''), warn: console.warn },
+    launch: async (extraArgs) => {
+      const launchArgs = [
+        '--disable-gpu',
+        '--no-first-run',
+        '--no-default-browser-check',
+        '--disable-blink-features=AutomationControlled',
+        ...extraArgs,
+      ];
+      if (executablePath) {
+        return chromium.launchPersistentContext(profileDir, { ...options, executablePath, args: launchArgs });
+      }
+      try {
+        return await chromium.launchPersistentContext(profileDir, { ...options, channel, args: launchArgs });
+      } catch (err) {
+        console.warn(`channel=${channel} 启动失败，回退自带 Chromium：${err.message}`);
+        return chromium.launchPersistentContext(profileDir, { ...options, args: launchArgs });
+      }
+    },
+  });
+}
+
+/** 复用的实例只断开 CDP，自己起的才关闭浏览器 */
+async function closeLaunched(launched) {
+  if (launched.reused) await launched.browser?.close?.().catch(() => {});
+  else await launched.context?.close().catch(() => {});
 }
 
 const signedIn = (page) =>
@@ -78,7 +99,8 @@ if (fromCdp) {
   // connectOverCDP 的 close 只断开，不会关掉对方浏览器
   await browser.close();
 
-  const persistent = await launch(statePath);
+  const launched = await launch(statePath);
+  const persistent = launched.context;
   try {
     const page = persistent.pages()[0] || (await persistent.newPage());
     await page.goto(`${config.browser.baseUrl || 'https://chat.deepseek.com'}/`, {
@@ -88,14 +110,18 @@ if (fromCdp) {
     await page.waitForTimeout(3_000);
     console.log(`独立 profile 登录态：${(await signedIn(page)) ? '已就绪' : '未就绪（可能复制的会话已过期）'}`);
   } finally {
-    await persistent.close();
+    await closeLaunched(launched);
     fs.rmSync(statePath, { force: true });
   }
 } else {
   console.log(`打开独立 profile：${profileDir}`);
   console.log('请在打开的浏览器里登录 https://chat.deepseek.com（脚本会等待登录完成，最多 10 分钟）');
   console.log('完成后会自动把凭据写入 data/（0600），无需手动复制 token。');
-  const persistent = await launch();
+  const launched = await launch();
+  const persistent = launched.context;
+  if (launched.reused) {
+    console.log(`检测到已有 profile 实例（pid ${launched.ownerPid ?? '?'} / CDP ${launched.port}），直接复用，不再启动第二个浏览器。`);
+  }
   let ok = false;
   let saved = null;
   try {
@@ -140,7 +166,7 @@ if (fromCdp) {
       console.error('未检测到登录，稍后可重新运行 `npm run auth:hybrid`。');
     }
   } finally {
-    await persistent.close();
+    await closeLaunched(launched);
   }
   if (!ok) process.exitCode = 1;
 }

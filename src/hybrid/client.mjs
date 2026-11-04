@@ -14,6 +14,7 @@ import {
 import { applyPatch, contentOf, createSseParser, createStreamState, reasoningOf } from '../direct/stream.mjs';
 import { parseCompletionBodies } from '../browser/stream-capture.mjs';
 import { Semaphore } from '../browser/semaphore.mjs';
+import { launchOrReusePersistent } from '../browser/profile-lock.mjs';
 import { sleep } from '../util.mjs';
 import { COMPLETION_PATH, createHybridStreamCapture } from './stream-capture.mjs';
 
@@ -268,7 +269,7 @@ export class HybridEngine {
       storageState: Boolean(state),
     });
 
-    const launchOnce = (options) =>
+    const launchOnce = (options, extraArgs = []) =>
       chromium.launchPersistentContext(profileDir, {
         headless: hybrid.headless,
         executablePath: hybrid.executablePath || undefined,
@@ -277,25 +278,37 @@ export class HybridEngine {
         viewport: this.config.browser.viewport,
         locale: this.config.browser.locale,
         timezoneId: process.env.TZ || 'Asia/Shanghai',
-        args: hybridLaunchArgs(),
+        // --remote-debugging-port=0：让 Chromium 把实际端口写进 DevToolsActivePort，
+        // 后续进程/登录脚本据此 CDP 复用同一实例，绝不启动第二个。
+        args: [...hybridLaunchArgs(), ...extraArgs],
       });
 
-    const context = await this.#withBackoff('persistent-launch', async () => {
-      const channel = hybrid.channel;
-      if (!hybrid.executablePath && channel) {
-        try {
-          return await launchOnce({ channel });
-        } catch (err) {
-          this.log.warn('hybrid：channel 启动失败，回退 Playwright 自带 Chromium', {
-            channel,
-            message: err.message,
-          });
+    // 单实例约束：profile 已被别的进程占用时只做 CDP 复用，不新起浏览器
+    const launched = await launchOrReusePersistent({
+      chromium,
+      profileDir,
+      log: this.log,
+      launch: (extraArgs) => this.#withBackoff('persistent-launch', async () => {
+        const channel = hybrid.channel;
+        if (!hybrid.executablePath && channel) {
+          try {
+            return await launchOnce({ channel }, extraArgs);
+          } catch (err) {
+            this.log.warn('hybrid：channel 启动失败，回退 Playwright 自带 Chromium', {
+              channel,
+              message: err.message,
+            });
+          }
         }
-      }
-      return launchOnce({});
+        return launchOnce({}, extraArgs);
+      }),
     });
+    const context = launched.context;
     this.context = context;
-    this.persistent = true;
+    // 复用的实例不归本引擎所有：关闭时只断开 CDP，不关别人的浏览器
+    this.persistent = !launched.reused;
+    this.profileShared = launched.reused;
+    if (launched.reused) this.browser = launched.browser;
     context.on('close', () => {
       this.contextClosed = true;
       this.page = null;

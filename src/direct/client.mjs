@@ -31,6 +31,17 @@ const API_ERROR_RETRY_DELAY_MS = 500;
 export const AUTH_INVALID_COOLDOWN_MS = 24 * 60 * 60_000;
 
 /**
+ * 上游「账号被禁言」：实测 2026-11-05 登录态有效但网页接口返回
+ * HTTP 502 / message="user is muted"。这是账号级风控，不是凭据失效：
+ * 重新登录 / 重开浏览器都不会恢复，反而会浪费登录态，所以按限流冷却处理。
+ */
+export const MUTED_COOLDOWN_MS = 10 * 60_000;
+
+export function isMutedMessage(message) {
+  return /user\s+is\s+muted|账号.{0,8}禁言|账户.{0,8}禁言/i.test(String(message || ''));
+}
+
+/**
  * 判断错误是否属于「这个账号此刻不能用」，可以在同一个请求里换号重试。
  *
  * 客户端断开（499）、超时、参数类错误都跟账号无关，直接抛给调用方；
@@ -312,7 +323,8 @@ export class DirectEngine {
           const partialOutput = Boolean(err.partialOutput);
           let retryAfterMs;
           if (err instanceof RateLimitError) {
-            retryAfterMs = Math.max(rateLimitBackoffMs, accountCooldownMs);
+            // 上游给的 retryAfterMs（禁言 10 分钟）必须生效，否则会每分钟重试一次、加重风控
+            retryAfterMs = Math.max(err.retryAfterMs ?? 0, rateLimitBackoffMs, accountCooldownMs);
             this.pool.markLimited(account, retryAfterMs);
           } else if (err instanceof AuthExpiredError) {
             retryAfterMs = AUTH_INVALID_COOLDOWN_MS;
@@ -513,6 +525,13 @@ export class DirectEngine {
             continue;
           }
           if (res.status === 401 || res.status === 403) throw new AuthExpiredError();
+          // 禁言是账号级风控：既不重试（重试只会加重风控），也不当成凭据失效
+          if (isMutedMessage(message)) {
+            throw new RateLimitError(
+              `DeepSeek 上游提示账号被禁言（${message}）：这是账号级风控，不是登录态失效，重新登录/重开浏览器无效`,
+              { retryAfterMs: MUTED_COOLDOWN_MS },
+            );
+          }
           if (res.status === 429 || /频繁|rate/i.test(message)) throw new RateLimitError(message);
 
           // 复用的会话被上游判为失效（会话不存在 / 不属于当前账号 / 已过期）：
@@ -768,6 +787,11 @@ export class DirectEngine {
     if (!id) {
       if (res.status === 401 || res.status === 403) throw new AuthExpiredError();
       const message = body?.msg || body?.data?.biz_msg || `HTTP ${res.status}`;
+      if (isMutedMessage(message)) {
+        throw new RateLimitError(`上游提示账号被禁言（${message}）：账号级风控，稍后重试`, {
+          retryAfterMs: MUTED_COOLDOWN_MS,
+        });
+      }
       if (res.status === 429 || /频繁/.test(message)) throw new RateLimitError(message);
       this.log.warn('上传附件失败', { name, message, status: res.status });
       throw new UpstreamError(`上传附件失败：${message}`, { code: 'attachment_upload_failed' });
@@ -821,6 +845,11 @@ export class DirectEngine {
     if (!session?.id) {
       if (res.status === 401 || res.status === 403) throw new AuthExpiredError();
       const message = body?.msg || body?.data?.biz_msg || `HTTP ${res.status}`;
+      if (isMutedMessage(message)) {
+        throw new RateLimitError(`上游提示账号被禁言（${message}）：账号级风控，稍后重试`, {
+          retryAfterMs: MUTED_COOLDOWN_MS,
+        });
+      }
       if (res.status === 429 || /频繁/.test(message)) throw new RateLimitError(message);
       throw new UpstreamError(`创建会话失败：${message}`, { code: 'session_failed' });
     }
