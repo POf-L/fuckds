@@ -116,8 +116,9 @@ test('ProtocolEngine：降级后由 hybrid 接管', async () => {
 });
 
 test('credentialSummary：只输出数量/布尔，不泄露值', () => {
+  const realToken = 't'.repeat(64);
   const summary = credentialSummary({
-    userToken: 'secret-token',
+    userToken: realToken,
     deviceId: 'secret-device',
     cookieHeader: 'secret=1',
     cookies: [{ name: 'smidV2', value: 'secret' }],
@@ -130,7 +131,7 @@ test('credentialSummary：只输出数量/布尔，不泄露值', () => {
   assert.deepEqual(summary.cookieNames, ['smidV2']);
   assert.equal(summary.hasHifLeim, true);
   const serialized = JSON.stringify(summary);
-  assert.equal(serialized.includes('secret-token'), false);
+  assert.equal(serialized.includes(realToken), false);
   assert.equal(serialized.includes('secret-hif'), false);
   assert.equal(serialized.includes('"secret"'), false);
 });

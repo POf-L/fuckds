@@ -5,10 +5,12 @@ import { DirectEngine } from '../direct/client.mjs';
 import { AuthExpiredError } from '../errors.mjs';
 import { fingerprintOf } from '../direct/account-pool.mjs';
 import { HybridEngine } from '../hybrid/client.mjs';
+import { evaluateCredentialState, isDispatchableState } from '../auth/credential-state.mjs';
 import {
   buildProtocolExtras,
   credentialSummary,
   harvestCredentials,
+  hasLoginMarker,
   loadCredentials,
   saveCredentials,
 } from './credentials.mjs';
@@ -75,16 +77,42 @@ export class ProtocolEngine {
     const perAccount = this.accounts.map((account) => {
       const snapshot = account.engine.status?.() ?? {};
       const scheduled = snapshot.scheduler?.[0] ?? {};
+      const inner = snapshot.accounts?.[0] ?? {};
+      const cred = evaluateCredentialState({
+        token: account.creds.userToken,
+        // 协议通道能拿到 hif：缺 hif 的匿名访客 token 不能当成登录态
+        hasLoginMarker: hasLoginMarker(account.creds),
+        harvestedAt: account.creds.harvestedAt || null,
+        authFailed: inner.authFailed ?? false,
+        lastAuthError: inner.lastAuthError ?? null,
+        maxAgeMs: this.config.protocol.tokenMaxAgeMs,
+        staleAgeMs: this.config.protocol.tokenStaleAgeMs,
+      });
+      const cooling = (scheduled.cooldownMs ?? 0) > 0;
+      const dispatchable = !cooling && isDispatchableState(cred.credentialState);
       return {
         accountHash: account.fingerprint.slice(0, 12),
-        available: scheduled.available !== false,
+        // available 保留旧字段名，含义改为“能真正派发”；dispatchable 同义，便于新旧监控兼容
+        available: dispatchable,
+        dispatchable,
+        credentialState: cred.credentialState,
+        credentialReason: cred.reason,
+        lastAuthError: cred.lastAuthError,
+        credentialAgeMs: cred.ageMs,
+        hasToken: cred.hasToken,
         inflight: scheduled.inflight ?? 0,
         queued: scheduled.queued ?? 0,
         cooldownMs: scheduled.cooldownMs ?? 0,
         lastStartAt: scheduled.lastStartAt ?? null,
-        credentials: credentialSummary(account.creds),
+        credentials: {
+          ...credentialSummary(account.creds),
+          hasToken: cred.hasToken,
+          credentialState: cred.credentialState,
+        },
       };
     });
+    const states = perAccount.map((a) => a.credentialState);
+    const dispatchableCount = perAccount.filter((a) => a.dispatchable).length;
     return {
       engine: 'protocol',
       layer: this.layer,
@@ -96,7 +124,9 @@ export class ProtocolEngine {
       // 多账号：每个账号独立的 in-flight / 队列长度 / 冷却（只给哈希前缀）
       accounts: perAccount,
       accountsTotal: perAccount.length,
-      credentials: this.accounts[0] ? credentialSummary(this.accounts[0].creds) : null,
+      credentialState: perAccount.length === 0 ? 'unknown' : dispatchableCount > 0 ? (states.includes('stale') ? 'stale' : 'valid') : states[0],
+      nextAction: dispatchableCount > 0 ? null : perAccount.length === 0 || states.some((s) => s === 'invalid' || s === 'anonymous') ? 're-login' : 'wait-cooldown',
+      credentials: this.accounts[0] ? { ...credentialSummary(this.accounts[0].creds), hasToken: perAccount[0]?.hasToken ?? false, credentialState: perAccount[0]?.credentialState } : null,
       // 网页会话复用状态：只暴露布尔与哈希前缀，绝不输出原始会话 id
       ...(this.inner?.sessionStatus?.() ?? {}),
       browser: this.layer === 'hybrid',

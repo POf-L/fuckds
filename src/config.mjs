@@ -132,6 +132,10 @@ export function loadConfig(env = process.env) {
       fallbackToHybrid: bool(env.PROTOCOL_FALLBACK_HYBRID, true),
       // 采集凭据时页面停留时间（给风控 SDK 写 hif 缓存的余量）
       harvestWaitMs: int(env.PROTOCOL_HARVEST_WAIT_MS, 2500),
+      // token 年龄硬阈值：超过即 credentialState=invalid（实测缓存 13.07h 必然 INVALID_TOKEN）
+      tokenMaxAgeMs: int(env.PROTOCOL_TOKEN_MAX_AGE_MS, 8 * 60 * 60 * 1000),
+      // token 年龄软阈值：超过标 stale，仍可派发但提示尽快更换
+      tokenStaleAgeMs: int(env.PROTOCOL_TOKEN_STALE_AGE_MS, 6 * 60 * 60 * 1000),
     },
     // 轻量浏览器传输引擎（ENGINE=light）：网络请求由浏览器自己发出，
     // Node 只负责 PoW 求解与 SSE 补丁渲染。

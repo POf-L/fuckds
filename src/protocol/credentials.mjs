@@ -3,6 +3,7 @@ import path from 'node:path';
 import { chromium } from 'playwright';
 
 import { hybridLaunchArgs } from '../hybrid/client.mjs';
+import { looksLikeLoginToken } from '../auth/credential-state.mjs';
 
 /**
  * 协议通道的凭据采集。
@@ -60,12 +61,14 @@ export function buildProtocolExtras(creds) {
 }
 
 export function credentialSummary(creds) {
+  const loginToken = looksLikeLoginToken(creds.userToken) && hasLoginMarker(creds);
   return {
     harvestedAt: creds.harvestedAt || null,
     ageMs: creds.harvestedAt ? Date.now() - creds.harvestedAt : null,
     cookieCount: creds.cookies?.length || 0,
     cookieNames: (creds.cookies || []).map((c) => c.name),
-    hasToken: Boolean(creds.userToken),
+    // hasToken 表示“有可用于登录态的 token”；匿名访客 token（30 字符、无 hif）不再报 true
+    hasToken: loginToken,
     hasDeviceId: Boolean(creds.deviceId),
     hasHifLeim: Boolean(creds.hifLeim),
     hasHifDliq: Boolean(creds.hifDliq),

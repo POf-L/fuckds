@@ -153,6 +153,14 @@ export class DirectEngine {
 
   status() {
     const scheduled = this.scheduler.stats();
+    const accounts = this.pool.status().map((account, index) => {
+      const s = scheduled[index] || {};
+      // scheduler.available 只代表“没在冷却”；能否派发还要看凭据状态
+      const dispatchable = s.available !== false && account.dispatchable;
+      return { ...account, ...s, available: dispatchable, dispatchable };
+    });
+    const states = accounts.map((a) => a.credentialState);
+    const dispatchableCount = accounts.filter((a) => a.dispatchable).length;
     return {
       engine: 'direct',
       browser: false,
@@ -160,8 +168,10 @@ export class DirectEngine {
       busy: this.inflight,
       queued: scheduled.reduce((sum, item) => sum + item.queued, 0),
       token: this.tokens.length > 0,
+      credentialState: accounts.length === 0 ? 'unknown' : dispatchableCount > 0 ? (states.includes('stale') ? 'stale' : 'valid') : states[0],
+      nextAction: dispatchableCount > 0 ? null : accounts.length === 0 || states.some((s) => s === 'invalid' || s === 'anonymous') ? 're-login' : 'wait-cooldown',
       // 每个账号的 in-flight / 队列长度 / 冷却状态（只给哈希前缀）
-      accounts: this.pool.status().map((account, index) => ({ ...account, ...(scheduled[index] || {}) })),
+      accounts,
       scheduler: scheduled,
       ...this.sessionStatus(),
     };
@@ -306,7 +316,9 @@ export class DirectEngine {
             this.pool.markLimited(account, retryAfterMs);
           } else if (err instanceof AuthExpiredError) {
             retryAfterMs = AUTH_INVALID_COOLDOWN_MS;
-            this.pool.markUnavailable(account, retryAfterMs, '登录态失效', { authFailed: true });
+            const authErrorCode = err.code
+              || (String(err.message || '').includes('INVALID_TOKEN') ? 'INVALID_TOKEN' : 'auth_failed');
+            this.pool.markUnavailable(account, retryAfterMs, '登录态失效', { authFailed: true, authErrorCode });
           } else if (this.pool.size > 1) {
             // 上游报错/人机验证：有别的号就轮换，没有别的号就别把自己锁死
             retryAfterMs = Math.max(1000, accountCooldownMs);

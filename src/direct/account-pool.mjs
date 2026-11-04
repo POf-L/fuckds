@@ -2,6 +2,8 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 
+import { evaluateCredentialState, isDispatchableState } from '../auth/credential-state.mjs';
+
 /** 账号指纹：会话归属、日志、/healthz 都用它，绝不输出 token 原值 */
 export function fingerprintOf(token) {
   return crypto.createHash('sha256').update(String(token || '')).digest('hex').slice(0, 16);
@@ -32,6 +34,8 @@ export class AccountPool {
       limitedCount: 0,
       errorCount: 0,
       lastError: null,
+      /** 最近一次认证失败的脱敏记录：只存时间与错误码，不存上游原文 */
+      lastAuthError: null,
       /** 登录态失效：换 token / 重启进程之前这个号不会再被选中 */
       authFailed: false,
       lastUsedAt: 0,
@@ -64,7 +68,7 @@ export class AccountPool {
     for (let i = 0; i < this.accounts.length; i += 1) {
       ordered.push(this.accounts[(this.cursor + i) % this.accounts.length]);
     }
-    const available = ordered.filter((account) => account.cooldownUntil <= now);
+    const available = ordered.filter((account) => account.cooldownUntil <= now && !account.authFailed);
     if (!available.length) return null;
     let chosen = available[0];
     if (loadOf) {
@@ -112,11 +116,14 @@ export class AccountPool {
    * 账号级失败（登录态失效 / 上游报错）导致的停用。
    * 冷却期内这个号不会被选中，避免每次请求先撞一次坏号、要靠客户端重发才能换号。
    */
-  markUnavailable(account, ms, reason, { authFailed = false } = {}) {
+  markUnavailable(account, ms, reason, { authFailed = false, authErrorCode = null } = {}) {
     account.cooldownUntil = Math.max(account.cooldownUntil, Date.now() + ms);
     account.errorCount += 1;
     account.lastError = reason;
-    if (authFailed) account.authFailed = true;
+    if (authFailed) {
+      account.authFailed = true;
+      account.lastAuthError = { at: Date.now(), code: authErrorCode || 'auth_failed' };
+    }
     const seconds = Math.round(ms / 100) / 10;
     this.log.warn(
       `账号 #${account.index + 1} 不可用（${reason}），停用 ${seconds}s（池内还有 ${
@@ -129,22 +136,38 @@ export class AccountPool {
     account.cooldownUntil = 0;
     account.authFailed = false;
     account.lastError = null;
+    account.lastAuthError = null;
   }
 
   status() {
     const now = Date.now();
-    return this.accounts.map((a) => ({
-      index: a.index + 1,
-      token: maskToken(a.token),
-      available: a.cooldownUntil <= now,
-      cooldownMs: Math.max(0, a.cooldownUntil - now),
-      requests: a.requests,
-      limited: a.limitedCount,
-      errors: a.errorCount,
-      lastError: a.lastError,
-      authFailed: a.authFailed,
-      powReady: Boolean(a.powNext),
-    }));
+    return this.accounts.map((a) => {
+      const credential = evaluateCredentialState({
+        token: a.token,
+        authFailed: a.authFailed,
+        lastAuthError: a.lastAuthError,
+        now,
+      });
+      const cooling = a.cooldownUntil > now;
+      return {
+        index: a.index + 1,
+        token: maskToken(a.token),
+        // available：队列能否派发（冷却 + 凭据可用）；credentialState：凭据本身的状态
+        available: !cooling && isDispatchableState(credential.credentialState),
+        dispatchable: !cooling && isDispatchableState(credential.credentialState),
+        credentialState: credential.credentialState,
+        credentialReason: credential.reason,
+        hasToken: credential.hasToken,
+        lastAuthError: credential.lastAuthError,
+        cooldownMs: Math.max(0, a.cooldownUntil - now),
+        requests: a.requests,
+        limited: a.limitedCount,
+        errors: a.errorCount,
+        lastError: a.lastError,
+        authFailed: a.authFailed,
+        powReady: Boolean(a.powNext),
+      };
+    });
   }
 
   close() {
