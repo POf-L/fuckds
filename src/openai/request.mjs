@@ -82,7 +82,17 @@ export function normalizeChatRequest(body, config) {
     ),
     thinking: resolveThinking(body, model, config),
     search: body.search === undefined ? config.deepseek.search : Boolean(body.search),
+    // 会话复用映射键：客户端显式给的最稳，没有就用 system+首条 user 的稳定哈希
+    conversationId: pickConversationId(body),
   };
+}
+
+/** 客户端自带的对话标识（OpenAI 无标准字段，这里兼容常见写法） */
+export function pickConversationId(body = {}) {
+  for (const candidate of [body.conversation_id, body.session_id, body.metadata?.conversation_id]) {
+    if (typeof candidate === 'string' && candidate.trim()) return candidate.trim();
+  }
+  return null;
 }
 
 /** 合并两份命中统计（只累加数量与标签名） */
@@ -142,6 +152,7 @@ export function normalizeCompletionRequest(body, config) {
     sanitize: { markup: cleaned.hits, stripped: { tools: 0, toolChoice: false } },
     stream: Boolean(body.stream),
     streamIncludeUsage: false,
+    conversationId: pickConversationId(body),
     ignored: [],
     thinking: config.deepseek.thinking === 'always',
     search: config.deepseek.search,

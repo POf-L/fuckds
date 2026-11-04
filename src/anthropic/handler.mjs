@@ -14,6 +14,8 @@ import { AnthropicSse } from './sse.mjs';
 export function createAnthropicHandler({ config, log, runChat, sendJson }) {
   async function handleMessages(req, res, body) {
     const request = normalizeMessagesRequest(body, config);
+    // 客户端可以用请求头显式指定对话标识（映射到固定网页会话）
+    request.conversationId ||= req.headers['x-conversation-id'] || req.headers['x-session-id'] || null;
     const id = newMessageId();
 
     const abort = new AbortController();
@@ -56,6 +58,7 @@ export function createAnthropicHandler({ config, log, runChat, sendJson }) {
         toolCalls: result.toolCalls.length,
         fabricated: result.fabricated,
         protocol: result.protocol,
+        session: result.session,
       });
       return sendJson(res, 200, payload);
     }
@@ -187,6 +190,7 @@ export function createAnthropicHandler({ config, log, runChat, sendJson }) {
         toolCalls: result.toolCalls.length,
         fabricated: result.fabricated,
         protocol: result.protocol,
+        session: result.session,
       });
       sse.end();
     } catch (err) {

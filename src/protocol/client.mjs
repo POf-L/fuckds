@@ -70,6 +70,8 @@ export class ProtocolEngine {
       lastRefreshAt: this.lastRefreshAt,
       lastHarvestMs: this.lastHarvestMs,
       credentials: this.creds ? credentialSummary(this.creds) : null,
+      // 网页会话复用状态：只暴露布尔与哈希前缀，绝不输出原始会话 id
+      ...(this.inner?.sessionStatus?.() ?? {}),
       browser: this.layer === 'hybrid',
       ...(this.layer === 'hybrid' && this.hybrid ? this.hybrid.health() : {}),
     };

@@ -8,7 +8,7 @@ import path from 'node:path';
  * DeepSeek 网页是按「窗口内消息条数」限流的，不是按发送间隔，
  * 所以多准备几个 userToken，撞限流就换下一个，比干等冷却快得多。
  *
- * 每个账号有独立的：门禁（冷却）、PoW 预解、会话预建、设备 ID。
+ * 每个账号有独立的：门禁（冷却）、PoW 预解、设备 ID、会话归属指纹。
  */
 export class AccountPool {
   constructor({ tokens, dataDir, logger, deviceIds = {} }) {
@@ -17,11 +17,12 @@ export class AccountPool {
     this.accounts = tokens.map((token, index) => ({
       index,
       token,
+      // 会话属于某个账号：复用会话时按这个指纹把请求钉回原号（不落盘原文）
+      fingerprint: crypto.createHash('sha256').update(token).digest('hex').slice(0, 16),
       // 协议通道会注入浏览器 profile 里真实的 deepseek-device-id:chat；
       // 没有注入时沿用按 token 派生的稳定设备 ID。
       deviceId: deviceIds[token] || loadDeviceId(dataDir, token),
       powNext: null,
-      sessionPool: [],
       cooldownUntil: 0,
       limitedCount: 0,
       errorCount: 0,
@@ -117,14 +118,12 @@ export class AccountPool {
       lastError: a.lastError,
       authFailed: a.authFailed,
       powReady: Boolean(a.powNext),
-      sessionsReady: a.sessionPool.length,
     }));
   }
 
   close() {
     for (const account of this.accounts) {
       account.powNext = null;
-      account.sessionPool = [];
     }
   }
 }

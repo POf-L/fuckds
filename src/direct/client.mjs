@@ -95,6 +95,15 @@ export class DirectEngine {
     this.inflight = 0;
     this.closed = false;
     this.coldStarted = false;
+    // 会话复用统计（/healthz 与报告用；只输出会话 id 的哈希前缀）
+    this.sessionsCreated = 0;
+    this.sessionsReused = 0;
+    this.sessionsRebuilt = 0;
+    this.lastSession = null;
+    // 上游 /api/v0/* 调用计数与最近一次补全的请求头名（只记名字，不记值）
+    this.apiCalls = { createSession: 0, powChallenge: 0, completion: 0, uploadFile: 0 };
+    this.lastHeaderNames = null;
+    this.lastParentUsedHash = null;
   }
 
   /* ------------------------------------------------------------------ */
@@ -107,13 +116,12 @@ export class DirectEngine {
     }
   }
 
-  /** 预热：第一个账号提前解好 PoW、建好会话，并跑一次冷启动序列 */
+  /** 预热：第一个账号提前解好 PoW，并跑一次冷启动序列（不再预建会话） */
   async warmUp() {
     await this.ensureStarted();
     const account = this.pool.accounts[0];
     if (!account) return;
     this.#prefetchPow(account);
-    this.#prewarmSession(account);
     await account.powNext?.catch((err) => this.log.warn('PoW 预热失败:', err.message));
 
     // 冷启动：让账号在服务端有一份「网页打开过」的痕迹，
@@ -145,6 +153,24 @@ export class DirectEngine {
       queued: 0,
       token: this.tokens.length > 0,
       accounts: this.pool.status(),
+      ...this.sessionStatus(),
+    };
+  }
+
+  /** 会话复用的对外状态（绝不输出原始 chat_session_id / parent_message_id） */
+  sessionStatus() {
+    return {
+      sessionReused: Boolean(this.lastSession?.reused),
+      webSessionHash: this.lastSession?.webSessionHash ?? null,
+      parentHash: this.lastSession?.parentHash ?? null,
+      sessionCreates: this.sessionsCreated,
+      sessionReuses: this.sessionsReused,
+      sessionRebuilds: this.sessionsRebuilt,
+      lastSessionReason: this.lastSession?.reason ?? null,
+      apiCalls: { ...this.apiCalls },
+      lastHeaderNames: this.lastHeaderNames,
+      // 本轮实际使用的 parent_message_id 哈希（用来核对 parent 链是否连续）
+      parentUsedHash: this.lastParentUsedHash,
     };
   }
 
@@ -158,7 +184,17 @@ export class DirectEngine {
    * 请求
    * ------------------------------------------------------------------ */
 
-  async chat({ prompt, thinking = false, search = false, refFileIds = [], signal, onDelta, onThinking, meta = {} }) {
+  async chat({
+    prompt,
+    thinking = false,
+    search = false,
+    refFileIds = [],
+    signal,
+    onDelta,
+    onThinking,
+    meta = {},
+    session = null,
+  }) {
     if (prompt.length > this.config.runtime.maxPromptChars) {
       throw new PromptTooLongError(
         `拼接后的 prompt 有 ${prompt.length} 字符，超过上限 ${this.config.runtime.maxPromptChars}`,
@@ -176,7 +212,8 @@ export class DirectEngine {
         if (signal?.aborted) throw new UpstreamError('客户端已断开', { status: 499, code: 'client_closed' });
 
         const now = Date.now();
-        const account = this.pool.pick(now);
+        // 复用会话时优先用会话所属账号；账号被换掉会让 parent 链失效，只能重建
+        const account = this.#pickAccount(now, session?.accountFingerprint);
         if (!account) {
           const wait = this.pool.nextAvailableAt() - now;
           if (wait > maxCooldownWaitMs) {
@@ -193,7 +230,7 @@ export class DirectEngine {
 
         try {
           const result = await this.#run({
-            account, prompt, thinking, search, refFileIds, signal, onDelta, onThinking, startedAt, meta,
+            account, prompt, thinking, search, refFileIds, signal, onDelta, onThinking, startedAt, meta, session,
           });
           this.pool.markHealthy(account);
           return result;
@@ -253,15 +290,77 @@ export class DirectEngine {
     }
   }
 
-  async #run({ account, prompt, thinking, search, refFileIds = [], signal, onDelta, onThinking, startedAt }) {
+  async #run({
+    account,
+    prompt,
+    thinking,
+    search,
+    refFileIds = [],
+    signal,
+    onDelta,
+    onThinking,
+    startedAt,
+    session = null,
+  }) {
     const powStart = Date.now();
     // powHeader 必须是 let：40301 重试时要把它置空，逼下一轮重新 fetch+solve，
     // 否则会一直拿同一个失效 header 重试（历史 bug：日志里连续 3 次 INVALID_POW_RESPONSE）。
     let powHeader;
-    const [sessionId, initialPowHeader] = await Promise.all([
-      this.#takeSession(account, signal),
-      this.#powHeader(account),
-    ]);
+
+    /* --- 会话：能复用就复用；否则只建这一次（不再预建下一个会话） --- */
+    let chatSessionId = session?.chatSessionId || null;
+    let parentMessageId = session?.parentMessageId || null;
+    let activePrompt = prompt;
+    let activeFileIds = refFileIds;
+    let sessionReused = Boolean(chatSessionId);
+    let sessionCreated = false;
+    let sessionRebuilt = false;
+
+    /** 这个请求里第一次真正需要新会话时才会调用；会话复用路径下 create 次数 = 1 */
+    const ensureSession = async () => {
+      if (chatSessionId) return;
+      chatSessionId = await this.#createSession(account, signal);
+      this.sessionsCreated += 1;
+      sessionCreated = true;
+    };
+
+    /** 会话失效 / 账号漂移时，调用方提供的「全量 prompt」用于重建（只重建一次） */
+    const rebuild = async (reason) => {
+      if (sessionRebuilt) return false;
+      if (typeof session?.rebuild !== 'function') {
+        throw new UpstreamError('会话需要重建，但调用方没有提供全量 prompt', { code: 'session_rebuild_unavailable' });
+      }
+      const full = await session.rebuild({ signal });
+      sessionRebuilt = true;
+      this.sessionsRebuilt += 1;
+      activePrompt = full.prompt;
+      activeFileIds = full.refFileIds ?? [];
+      parentMessageId = null;
+      chatSessionId = null;
+      sessionReused = false;
+      await ensureSession();
+      this.log.warn('复用会话不可用，已用全量 prompt 重建一次', {
+        reason,
+        session: hashPrefix(session?.chatSessionId),
+        account: account.index + 1,
+      });
+      return true;
+    };
+
+    // 账号被换掉时，原会话的 parent 链在新 token 下无效：先用全量 prompt 重建
+    let rebuildReason = null;
+    if (chatSessionId && session?.accountFingerprint && session.accountFingerprint !== account.fingerprint) {
+      rebuildReason = 'account-changed';
+    }
+
+    if (rebuildReason) {
+      await rebuild(rebuildReason);
+    } else {
+      await ensureSession();
+      if (sessionReused) this.sessionsReused += 1;
+    }
+
+    const initialPowHeader = await this.#powHeader(account);
     powHeader = initialPowHeader;
     const powMs = Date.now() - powStart;
     this.#prefetchPow(account);
@@ -302,21 +401,28 @@ export class DirectEngine {
           // 重试消耗掉了之前预解的那个，顺手再预解一个给后续请求。
           this.#prefetchPow(account);
         }
+        const requestHeaders = {
+          ...this.#headers(account),
+          'x-ds-pow-response': header,
+          // 线上补全请求的 Referer 是具体会话页（/a/chat/s/<session>），不是站点根路径
+          // 复用时同一个会话 id → Referer 恒定，不会出现「每次都是新会话」的痕迹
+          referer: `${this.baseUrl}/a/chat/s/${chatSessionId}`,
+        };
+        // 只记录头名（报告里做「新建 vs 复用」的头级对比，不落任何值）
+        this.lastHeaderNames = Object.keys(requestHeaders).sort();
+        this.lastParentUsedHash = hashPrefix(parentMessageId);
+        this.apiCalls.completion += 1;
         const res = await fetch(`${this.baseUrl}${COMPLETION_PATH}`, {
           method: 'POST',
           signal: controller.signal,
-          headers: {
-            ...this.#headers(account),
-            'x-ds-pow-response': header,
-            // 线上补全请求的 Referer 是具体会话页（/a/chat/s/<session>），不是站点根路径
-            referer: `${this.baseUrl}/a/chat/s/${sessionId}`,
-          },
+          headers: requestHeaders,
           body: JSON.stringify({
-            chat_session_id: sessionId,
-            parent_message_id: null,
+            chat_session_id: chatSessionId,
+            // 复用会话：挂在上一轮 assistant 消息下面；新会话 / 重建时为 null
+            parent_message_id: parentMessageId,
             model_type: 'default',
-            prompt,
-            ref_file_ids: refFileIds,
+            prompt: activePrompt,
+            ref_file_ids: activeFileIds,
             thinking_enabled: Boolean(thinking),
             search_enabled: Boolean(search),
             action: null,
@@ -339,6 +445,21 @@ export class DirectEngine {
           }
           if (res.status === 401 || res.status === 403) throw new AuthExpiredError();
           if (res.status === 429 || /频繁|rate/i.test(message)) throw new RateLimitError(message);
+
+          // 复用的会话被上游判为失效（会话不存在 / 不属于当前账号 / 已过期）：
+          // 用全量 prompt 重建一次；重试需要新的 PoW（旧的那次已经被这次失败消耗）。
+          // 说明：上游对「会话不存在/不属于该账号」有时只回一个没有 msg/code 的 4xx
+          // （实测 422 body 里的信息不足以判定），所以复用路径上把这些状态也当作会话失效。
+          // 只会重建一次；若重建后仍失败，会按普通上游错误显式抛出，不静默吞掉。
+          const statusSuggestsSession = res.status === 400 || res.status === 404
+            || res.status === 410 || res.status === 422;
+          if (sessionReused && !sessionRebuilt
+            && (looksLikeInvalidSession(message, code, res.status) || statusSuggestsSession)) {
+            const reason = `invalid-session: HTTP ${res.status} ${String(message).slice(0, 100)}`;
+            powHeader = null;
+            await rebuild(reason);
+            continue;
+          }
 
           // 网页接口返回错误：重试最多 3 次再抛错
           apiRetries += 1;
@@ -435,6 +556,16 @@ export class DirectEngine {
           throw new RateLimitError('网页接口没有返回内容（多半是消息发得太频繁，被限流）');
         }
 
+        // 会话链信息：调用方据此把「本轮 assistant message id」作为下一轮的 parent
+        this.lastSession = {
+          webSessionHash: hashPrefix(chatSessionId),
+          parentHash: hashPrefix(state.messageId),
+          reused: Boolean(sessionReused),
+          created: Boolean(sessionCreated),
+          rebuilt: Boolean(sessionRebuilt),
+          reason: sessionRebuilt ? 'rebuild' : sessionReused ? 'append' : 'new',
+        };
+
         return {
           text: emittedContent,
           reasoning: emittedReasoning,
@@ -448,6 +579,14 @@ export class DirectEngine {
             totalMs: Date.now() - startedAt,
           },
           usage: state.usage,
+          // 会话复用：返回会话与消息 id（只给内部用，日志/接口只输出哈希前缀）
+          chatSessionId,
+          messageId: state.messageId || null,
+          accountFingerprint: account.fingerprint || null,
+          sessionReused,
+          sessionCreated,
+          sessionRebuilt,
+          sessionRebuildReason: sessionRebuilt ? 'rebuild' : null,
         };
       } finally {
         clearTimeout(timeoutTimer);
@@ -543,6 +682,7 @@ export class DirectEngine {
       locale: 'zh_CN',
       timezoneOffsetSec: -new Date().getTimezoneOffset() * 60,
     });
+    this.apiCalls.uploadFile += 1;
     const res = await fetch(`${this.baseUrl}${UPLOAD_PATH}`, {
       method: 'POST',
       headers: { ...uploadHeaders, 'x-ds-pow-response': powHeader },
@@ -579,24 +719,22 @@ export class DirectEngine {
     });
   }
 
-  async #takeSession(account, signal) {
-    const pooled = account.sessionPool.pop();
-    const id = pooled || (await this.#createSession(account, signal));
-    this.#prewarmSession(account); // 本轮生成期间就把下一轮会话建好
-    return id;
-  }
-
-  #prewarmSession(account) {
-    if (this.closed || account.sessionPool.length) return;
-    setTimeout(() => {
-      if (this.closed || account.sessionPool.length) return;
-      this.#createSession(account)
-        .then((id) => account.sessionPool.push(id))
-        .catch(() => {});
-    }, 0).unref?.();
+  /** 复用会话时优先选会话所属账号；拿不到（被停用/换 token）就走正常轮询并触发重建 */
+  #pickAccount(now, preferredFingerprint) {
+    if (preferredFingerprint) {
+      const preferred = this.pool.accounts.find((a) => a.fingerprint === preferredFingerprint);
+      if (preferred) {
+        if (preferred.cooldownUntil > now) return null;
+        preferred.lastUsedAt = now;
+        preferred.requests += 1;
+        return preferred;
+      }
+    }
+    return this.pool.pick(now);
   }
 
   async #createSession(account, signal) {
+    this.apiCalls.createSession += 1;
     const res = await fetch(`${this.baseUrl}/api/v0/chat_session/create`, {
       method: 'POST',
       headers: this.#headers(account),
@@ -615,6 +753,7 @@ export class DirectEngine {
   }
 
   async #fetchChallenge(account, targetPath = COMPLETION_PATH) {
+    this.apiCalls.powChallenge += 1;
     const res = await fetch(`${this.baseUrl}/api/v0/chat/create_pow_challenge`, {
       method: 'POST',
       headers: this.#headers(account),
@@ -709,6 +848,26 @@ export class DirectEngine {
     // expire_at 用于取用时判断是否已过期（见 #powHeader）；服务端字段缺失时为 undefined。
     return { header, expireAt: challenge.expire_at };
   }
+}
+
+/**
+ * 上游错误是否指向「复用的会话不可用」。
+ * 只在复用路径里判定；401/403/429 已在调用前单独处理，不会走到这里。
+ */
+export function looksLikeInvalidSession(message, code, status) {
+  const text = `${message || ''} ${code || ''}`;
+  if (status === 404 || status === 410) return true;
+  return [
+    /session.{0,24}(not.{0,8}(exist|found)|invalid|expired|deleted|unavailable)/i,
+    /(会话|对话).{0,12}(不存在|无效|失效|已过期|已删除|找不到)/,
+    /chat_session_id.{0,24}(invalid|not.{0,8}(exist|found)|error)/i,
+  ].some((re) => re.test(text));
+}
+
+/** 会话 id / 消息 id 的哈希前缀（日志与 /healthz 只暴露这个） */
+export function hashPrefix(id, len = 12) {
+  if (!id) return null;
+  return crypto.createHash('sha256').update(String(id)).digest('hex').slice(0, len);
 }
 
 async function readJsonSafely(res) {

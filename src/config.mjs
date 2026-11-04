@@ -260,6 +260,12 @@ export function loadConfig(env = process.env) {
       maxAttachmentChars: int(env.MAX_ATTACHMENT_CHARS, 2_000_000),
       // 关掉就恢复旧行为：超长直接 413
       overflowToAttachment: bool(env.OVERFLOW_TO_ATTACHMENT, true),
+      // 网页会话复用：同一段对话只建一次 chat_session，后续用 parent_message_id 追加
+      sessionReuse: bool(env.SESSION_REUSE, true),
+      // 映射多久没动过就不再复用（防止「相同开头的新对话」串进旧会话）
+      sessionTtlMs: int(env.SESSION_TTL_MS, 6 * 60 * 60_000),
+      // 最多保留多少个会话映射（LRU 淘汰）
+      maxWebSessions: int(env.MAX_WEB_SESSIONS, 100),
       // 浏览器模式：抓页面自己发出的 /api/v0/chat/completion 原始流，用模型原始输出
       // （含 DO 工具调用 token）作为权威文本，DOM 只负责流式展示。关掉退回纯 DOM 提取。
       browserCapture: bool(env.BROWSER_CAPTURE, true),

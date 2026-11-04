@@ -90,6 +90,11 @@ export function normalizeMessagesRequest(body, config) {
     },
     stream: Boolean(body.stream),
     streamIncludeUsage: false,
+    // 会话复用映射键（Anthropic 也没有标准字段；metadata.user_id 是终端用户，不是对话）
+    conversationId:
+      [body.conversation_id, body.session_id, body.metadata?.conversation_id].find(
+        (v) => typeof v === 'string' && v.trim(),
+      )?.trim() || null,
     // 网页版不能调采样参数，这些字段接受但忽略，保持客户端兼容
     ignored: [
       'temperature',

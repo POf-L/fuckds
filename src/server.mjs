@@ -3,6 +3,7 @@ import http from 'node:http';
 import { ApiError } from './errors.mjs';
 import { createAdminHandler } from './admin/routes.mjs';
 import { createChatRunner } from './chat-runner.mjs';
+import { WebSessionStore } from './session/store.mjs';
 import { createAnthropicHandler } from './anthropic/handler.mjs';
 import { anthropicErrorPayload } from './anthropic/response.mjs';
 import { normalizeChatRequest, normalizeCompletionRequest } from './openai/request.mjs';
@@ -29,8 +30,15 @@ export function createServer({ config, logger, web }) {
     });
   });
 
-  /** 两个协议共用同一套执行逻辑（防自造结果 / 超长转附件） */
-  const runChat = createChatRunner({ config, log, web });
+  /** 网页会话映射（落盘 data/web-sessions.json）：同一段对话复用同一个 chat_session */
+  const sessions = new WebSessionStore({
+    dataDir: config.dataDir,
+    logger: log,
+    ttlMs: config.runtime.sessionTtlMs,
+    maxEntries: config.runtime.maxWebSessions,
+  });
+  /** 两个协议共用同一套执行逻辑（防自造结果 / 超长转附件 / 会话复用） */
+  const runChat = createChatRunner({ config, log, web, sessions });
   const anthropic = createAnthropicHandler({ config, log, runChat, sendJson });
   /** 网页控制台：/admin 静态页 + /admin/api/* 管理接口 */
   const admin = createAdminHandler({ config, logger, web });
@@ -64,6 +72,8 @@ export function createServer({ config, logger, web }) {
           pid: process.pid,
           uptime_s: Math.round(process.uptime()),
           ...web.status(),
+          // 会话复用状态：sessionReused / webSessionHash（哈希前缀）/ 建会话/复用/重建计数
+          sessions: sessions.status(),
           version: 1,
         });
       }
@@ -95,6 +105,7 @@ export function createServer({ config, logger, web }) {
         requireAuth(req, config);
         const body = await readJson(req);
         const request = normalizeChatRequest(body, config);
+        request.conversationId ||= headerConversationId(req);
         return await handleChat(req, res, request);
       }
 
@@ -102,6 +113,7 @@ export function createServer({ config, logger, web }) {
         requireAuth(req, config);
         const body = await readJson(req);
         const request = normalizeCompletionRequest(body, config);
+        request.conversationId ||= headerConversationId(req);
         return await handleLegacyCompletion(req, res, request);
       }
 
@@ -183,6 +195,7 @@ export function createServer({ config, logger, web }) {
         toolCalls: result.toolCalls.length,
         fabricated: result.fabricated,
         protocol: result.protocol,
+        session: result.session,
       });
       return sendJson(res, 200, payload);
     }
@@ -304,6 +317,7 @@ export function createServer({ config, logger, web }) {
         toolCalls: toolCalls.length,
         fabricated: result.fabricated,
         protocol: result.protocol,
+        session: result.session,
       });
       sse.done();
     } catch (err) {
@@ -403,6 +417,12 @@ function sendHtml(res, status, html) {
   res.end(html);
 }
 
+/** 请求头里的对话标识（可选；没有就用消息前缀哈希） */
+function headerConversationId(req) {
+  const value = req.headers['x-conversation-id'] || req.headers['x-session-id'];
+  return typeof value === 'string' && value.trim() ? value.trim() : null;
+}
+
 function escapeHtml(s) {
   return String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
 }
@@ -450,7 +470,7 @@ th{background:#f6f8fa}
 <tr><td><code>GET /v1/models</code></td><td>模型列表</td></tr>
 <tr><td><code>GET /healthz</code></td><td>健康检查 / 浏览器状态</td></tr>
 </table>
-<p>每条消息都会新开一个 DeepSeek 网页对话，历史上下文拼在同一个 prompt 里（<code>## User</code> / <code>## Assistant</code> / <code>## Tool_calls</code> / <code>## Tool_call_result</code>）；工具调用由模型按原生 DSML 输出，服务端解析成标准 <code>tool_calls</code>。</p>
+<p>同一段对话复用同一个 DeepSeek 网页会话（全程只 <code>/chat_session/create</code> 一次），后续轮次用 <code>parent_message_id</code> 追加、只提交本轮新增内容；首轮上下文按 <code>## User</code> / <code>## Assistant</code> / <code>## Tool_calls</code> / <code>## Tool_call_result</code> 分段。工具调用走纯文本协议，服务端解析成标准 <code>tool_calls</code>。</p>
 <pre>${escapeHtml(example)}</pre>
 <pre>${escapeHtml(anthropicExample)}</pre>
 <p style="color:#6b7280">登录态：${config.deepseek.token ? '已配置 ✅' : '未配置 ❌ 执行 npm run auth -- &lt;userToken&gt;'}</p>

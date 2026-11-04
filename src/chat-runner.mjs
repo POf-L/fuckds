@@ -7,11 +7,12 @@ import {
   stripToolMarkup,
   ToolMarkupStreamFilter,
 } from './openai/tool-text.mjs';
-import { buildPrompt } from './prompt/build.mjs';
+import { buildDeltaPrompt, buildPrompt, collectToolNamesById } from './prompt/build.mjs';
 import { planOverflow } from './prompt/overflow.mjs';
 import { assertNoProtocolTags } from './prompt/sanitize.mjs';
 import { parseTextToolCalls, scanTextToolCallBlocks } from './prompt/text-protocol.mjs';
 import { parseToolCalls } from './prompt/tools.mjs';
+import { hashId } from './session/store.mjs';
 
 /**
  * 引擎调用的公共部分：拼 prompt → 图片/超长附件上传 → 调 web.chat → 解析工具调用。
@@ -19,7 +20,7 @@ import { parseToolCalls } from './prompt/tools.mjs';
  * OpenAI 和 Anthropic 两个协议层只负责请求归一化和响应格式，执行逻辑都在这里，
  * 保证两条链路在「防自造结果」「超长转附件」上的行为完全一致。
  */
-export function createChatRunner({ config, log, web }) {
+export function createChatRunner({ config, log, web, sessions = null }) {
   /**
    * @param {object} request 归一化后的内部请求（messages 为 OpenAI 语义）
    * @param {object} [hooks]
@@ -43,19 +44,62 @@ export function createChatRunner({ config, log, web }) {
       if (plan.attachment) assertNoProtocolTags(plan.attachment.buffer.toString('utf8'), '附件');
     };
 
-    /** 拼 prompt；超过输入框上限时把较早的段落拆成附件 */
-    const prepare = (systemExtra = '') => {
-      const built = buildPrompt({ messages: request.messages, tools: request.tools, systemExtra });
+    /** 拼全量 prompt；超过输入框上限时把较早的段落拆成附件 */
+    const buildFull = () => {
+      const built = buildPrompt({ messages: request.messages, tools: request.tools });
       const plan = overflowToAttachment
         ? planOverflow(built.prompt, { maxChars: maxPromptChars, maxAttachmentChars })
         : { prompt: built.prompt, attachment: null };
       guard(plan, built.protocolText);
-      return { built, prompt: plan.prompt, attachment: plan.attachment };
+      return { built, plan };
     };
 
-    const initial = prepare();
-    const { toolNames, stats } = initial.built;
-    const prompt = initial.prompt;
+    const full = buildFull();
+    const toolNames = full.built.toolNames;
+
+    /*
+     * 会话复用：同一段对话只建一次网页会话，后续只发本轮新增内容。
+     * hybrid（全浏览器降级）按页面 UI 驱动，没有会话映射，直接走全量。
+     */
+    const sessionAllowed = config.runtime.sessionReuse !== false && Boolean(sessions);
+    const layer = typeof web.status === 'function' ? web.status()?.layer : null;
+    let plan = full.plan;
+    let built = full.built;
+    let sessionPlan = { key: null, reason: 'disabled', hashes: [], entry: null };
+    let sessionArgs = null;
+    let sessionMode = 'new';
+
+    if (sessionAllowed && layer !== 'hybrid') {
+      sessionPlan = sessions.plan(request.messages, { conversationId: request.conversationId });
+      if (sessionPlan.reuse) {
+        const delta = buildDeltaPrompt({
+          messages: request.messages,
+          from: sessionPlan.deltaFrom,
+          toolNameById: collectToolNamesById(request.messages),
+        });
+        const deltaPlan = overflowToAttachment
+          ? planOverflow(delta.prompt, { maxChars: maxPromptChars, maxAttachmentChars })
+          : { prompt: delta.prompt, attachment: null };
+        if (deltaPlan.prompt.length <= maxPromptChars) {
+          guard(deltaPlan, '');
+          plan = deltaPlan;
+          built = { ...full.built, prompt: deltaPlan.prompt, stats: delta.stats };
+          sessionArgs = {
+            chatSessionId: sessionPlan.entry.chatSessionId,
+            parentMessageId: sessionPlan.entry.lastMessageId,
+            accountFingerprint: sessionPlan.entry.accountFingerprint,
+            reuse: true,
+          };
+          sessionMode = 'reuse';
+        } else {
+          // 增量本身也超长：放弃复用，退回全量新会话（多一次 create，日志留原因）
+          sessionPlan.reason = 'delta-too-long';
+        }
+      }
+    }
+
+    const prompt = plan.prompt;
+    const stats = built.stats;
 
     // 图片：下载/解码 → 传成 DeepSeek 附件 → ref_file_ids
     const imageIds = [];
@@ -65,22 +109,92 @@ export function createChatRunner({ config, log, web }) {
       log?.info?.('已上传图片', { count: imageIds.length });
     }
 
-    const uploadAttachment = async (plan) => {
-      if (!plan.attachment) return [];
+    const uploadAttachment = async (attachmentPlan) => {
+      if (!attachmentPlan.attachment) return [];
       if (typeof web.uploadAttachments !== 'function') {
         throw new PromptTooLongError('当前引擎不支持附件上传，无法承载超长上下文');
       }
-      const ids = await web.uploadAttachments([plan.attachment]);
+      const ids = await web.uploadAttachments([attachmentPlan.attachment]);
       log?.info?.('上下文超长，较早内容已转为附件', {
-        name: plan.attachment.name,
-        chars: plan.attachment.chars,
-        sections: plan.attachment.sections,
+        name: attachmentPlan.attachment.name,
+        chars: attachmentPlan.attachment.chars,
+        sections: attachmentPlan.attachment.sections,
       });
       return ids;
     };
 
-    const fileIds = [...imageIds, ...(await uploadAttachment(initial))];
-    onPrompt?.(prompt, { stats, attachment: initial.attachment, sanitize: request.sanitize });
+    const fileIds = [...imageIds, ...(await uploadAttachment(plan))];
+
+    /** 会话失效时引擎回调这里拿「全量 prompt + 附件」（真正需要重建时才上传） */
+    const rebuildSession = async () => ({
+      prompt: full.plan.prompt,
+      refFileIds: [...imageIds, ...(await uploadAttachment(full.plan))],
+    });
+
+    onPrompt?.(prompt, {
+      stats,
+      attachment: plan.attachment,
+      sanitize: request.sanitize,
+      session: sessionPlan.key
+        ? {
+            mode: sessionMode,
+            reason: sessionPlan.reason,
+            keyHash: hashId(sessionPlan.key),
+            webSessionHash:
+              sessionMode === 'reuse' && sessionPlan.entry ? hashId(sessionPlan.entry.chatSessionId) : null,
+            parentHash: sessionMode === 'reuse' && sessionPlan.entry ? hashId(sessionPlan.entry.lastMessageId) : null,
+            deltaFrom: sessionPlan.reuse ? sessionPlan.deltaFrom : null,
+          }
+        : null,
+    });
+
+    /** 一轮成功后把会话链落盘（进程重启后还能续上同一网页会话） */
+    const commitSession = (result) => {
+      if (!sessions || !sessionPlan.key) return;
+      if (!result?.chatSessionId) {
+        // 引擎没有返回会话（例如 hybrid 降级）：这条映射不再可用
+        sessions.drop(sessionPlan.key);
+        return;
+      }
+      sessions.commit(sessionPlan.key, {
+        chatSessionId: result.chatSessionId,
+        lastMessageId: result.messageId,
+        accountFingerprint: result.accountFingerprint,
+        sentHashes: sessionPlan.hashes,
+        reused: Boolean(result.sessionReused),
+        created: Boolean(result.sessionCreated),
+        rebuilt: Boolean(result.sessionRebuilt),
+        reason: result.sessionRebuildReason || sessionPlan.reason,
+        promptChars: prompt.length,
+      });
+      log?.info?.('网页会话', {
+        id: meta.id,
+        mode: result.sessionRebuilt ? 'rebuild' : result.sessionReused ? 'reuse' : 'new',
+        webSession: hashId(result.chatSessionId),
+        parent: hashId(result.messageId),
+        promptChars: prompt.length,
+        deltaFrom: sessionPlan.reuse ? sessionPlan.deltaFrom : null,
+        reason: result.sessionRebuildReason || sessionPlan.reason,
+      });
+    };
+
+    /** 计数用：会话失效重建时实际发出去的是全量 prompt（不是增量） */
+    const effectivePrompt = (result) => (result?.sessionRebuilt ? full.plan.prompt : prompt);
+
+    /** 给日志/接口的会话摘要：只有哈希前缀，没有原始 id */
+    const sessionInfo = (result) =>
+      result?.chatSessionId
+        ? {
+            reused: Boolean(result.sessionReused),
+            created: Boolean(result.sessionCreated),
+            rebuilt: Boolean(result.sessionRebuilt),
+            keyHash: sessionPlan.key ? hashId(sessionPlan.key) : null,
+            webSessionHash: hashId(result.chatSessionId),
+            parentHash: hashId(result.messageId),
+            reason: result.sessionRebuildReason || sessionPlan.reason,
+            deltaFrom: sessionPlan.reuse ? sessionPlan.deltaFrom : null,
+          }
+        : null;
 
     const knownTools = toolNames.length ? toolNames : null;
 
@@ -168,6 +282,10 @@ export function createChatRunner({ config, log, web }) {
     const cleanReasoning = (reasoning) =>
       reasoning && hasFabricatedProtocol(reasoning) ? stripToolMarkup(reasoning) : reasoning || '';
 
+    /**
+     * 复用会话时把 chatSessionId / parentMessageId 交给引擎，并挂上「失效时重建」的回调；
+     * 非复用路径传 null，由引擎建一次新会话（一次对话全程 create 次数 = 1）。
+     */
     const run = (promptText = prompt, ids = fileIds, hooks = {}) =>
       web.chat({
         prompt: promptText,
@@ -176,6 +294,7 @@ export function createChatRunner({ config, log, web }) {
         refFileIds: ids,
         signal,
         meta,
+        session: sessionArgs ? { ...sessionArgs, rebuild: rebuildSession } : null,
         onDelta: hooks.onDelta,
         onThinking: hooks.onThinking,
       });
@@ -190,12 +309,14 @@ export function createChatRunner({ config, log, web }) {
           toolCalls: reply.toolCalls.length,
         });
       }
+      commitSession(result);
 
       return {
-        prompt,
+        prompt: effectivePrompt(result),
         stats,
-        attachment: initial.attachment,
+        attachment: plan.attachment,
         sanitize: request.sanitize,
+        session: sessionInfo(result),
         text: result.text,
         reasoning: cleanReasoning(result.reasoning),
         elapsedMs: result.elapsedMs,
@@ -218,13 +339,7 @@ export function createChatRunner({ config, log, web }) {
       onReasoning?.(text);
     };
 
-    const result = await web.chat({
-      prompt,
-      thinking: request.thinking,
-      search: request.search,
-      refFileIds: fileIds,
-      signal,
-      meta,
+    const result = await run(prompt, fileIds, {
       onDelta: (text) => {
         const safe = filter.push(text);
         if (safe) emitContent(safe);
@@ -275,11 +390,14 @@ export function createChatRunner({ config, log, web }) {
       });
     }
 
+    commitSession(result);
+
     return {
-      prompt,
+      prompt: effectivePrompt(result),
       stats,
-      attachment: initial.attachment,
+      attachment: plan.attachment,
       sanitize: request.sanitize,
+      session: sessionInfo(result),
       text: authoritativeText,
       reasoning: finalReasoning,
       streamedContent: sentContent,
