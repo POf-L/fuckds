@@ -1,4 +1,5 @@
 import { findDsmlBlocks, findDsmlStart } from '../prompt/dsml.mjs';
+import { findPendingProtocolTag, stripProtocolTags } from '../prompt/sanitize.mjs';
 import { canonicalArguments, readJsonObject } from '../prompt/tools.mjs';
 
 /**
@@ -121,11 +122,26 @@ export function findToolMarkup(text) {
   const blocks = [];
   if (!text) return blocks;
 
-  // <tool_call>{...}</tool_call>
-  const xmlPattern = /<tool_call>[\s\S]*?<\/tool_call>/g;
+  // <tool_call>{...}</tool_call>（带属性 / <tool_calls> 也认）
+  const xmlPattern = /<tool_calls?\b[^>]*>[\s\S]*?<\/tool_calls?>/gi;
   let xml;
   while ((xml = xmlPattern.exec(text)) !== null) {
     blocks.push({ kind: 'TOOL_CALL', start: xml.index, end: xml.index + xml[0].length });
+  }
+
+  // <function_calls>…</function_calls>（Anthropic 风格：外层包多个 invoke）
+  const functionCalls = /<function_calls\b[^>]*>[\s\S]*?<\/function_calls>/gi;
+  let fc;
+  while ((fc = functionCalls.exec(text)) !== null) {
+    blocks.push({ kind: 'TOOL_CALL', start: fc.index, end: fc.index + fc[0].length });
+  }
+
+  // <antml:invoke> / <invoke> / <parameter> 块（没有外层包装时单独成块）
+  const invokeBlock = /<(?:antml:)?(?:invoke|parameter)\b[^>]*>[\s\S]*?<\/(?:antml:)?(?:invoke|parameter)>/gi;
+  let inv;
+  while ((inv = invokeBlock.exec(text)) !== null) {
+    if (covered(blocks, inv.index)) continue;
+    blocks.push({ kind: 'TOOL_CALL', start: inv.index, end: inv.index + inv[0].length });
   }
 
   // DSML：<｜DSML｜calls>…</｜DSML｜calls>（含未闭合的残段）
@@ -257,7 +273,6 @@ export function findSectionBlocks(text) {
 export function stripToolMarkup(text) {
   if (!text) return '';
   const blocks = findToolMarkup(text);
-  if (!blocks.length) return text;
 
   let out = '';
   let cursor = 0;
@@ -267,11 +282,13 @@ export function stripToolMarkup(text) {
   }
   out += text.slice(cursor);
 
-  return out
-    // 协议行被拿走后常常只剩一对空代码块
-    .replace(/```[a-zA-Z0-9_+-]*[ \t]*\r?\n[ \t]*\r?\n?[ \t]*```(\r?\n)?/g, '')
-    .replace(/\n{3,}/g, '\n\n')
-    .trim();
+  return (
+    stripProtocolTags(out)
+      // 协议行被拿走后常常只剩一对空代码块
+      .replace(/```[a-zA-Z0-9_+-]*[ \t]*\r?\n[ \t]*\r?\n?[ \t]*```(\r?\n)?/g, '')
+      .replace(/\n{3,}/g, '\n\n')
+      .trim()
+  );
 }
 
 /**
@@ -526,6 +543,9 @@ export class ToolMarkupStreamFilter {
       // 半截 <|END 也不能先发（完整 <|END|> 由 findToolMarkup 整块剔除）
       const pendingEnd = findPendingEndToken(this.buffer, this.emitted);
       if (pendingEnd >= 0) limit = Math.min(limit, pendingEnd);
+      // 半截 <tool_call> / <function_calls> / <antml:invoke> 同理：闭合前扣在手里
+      const pendingTag = findPendingProtocolTag(this.buffer, this.emitted);
+      if (pendingTag >= 0) limit = Math.min(limit, pendingTag);
     }
     return this.#slice(limit);
   }

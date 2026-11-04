@@ -1,6 +1,13 @@
 import { ApiError } from '../errors.mjs';
 import { contentToText } from '../util.mjs';
-import { FINAL_ANSWER_HINT, PROMPT_HEADER, REPLY_END_TOKEN, SECTION, SPECIAL_TOKENS_HEADER } from './special.mjs';
+import {
+  BASE_SYSTEM_RULES,
+  FINAL_ANSWER_HINT,
+  PROMPT_HEADER,
+  REPLY_END_TOKEN,
+  SECTION,
+  SPECIAL_TOKENS_HEADER,
+} from './special.mjs';
 import { collectToolNames, renderToolDeclarations, renderToolResult } from './tools.mjs';
 
 const VALID_ROLES = new Set(['system', 'developer', 'user', 'assistant', 'tool', 'function']);
@@ -114,8 +121,10 @@ export function buildPrompt({ messages, tools = [], systemExtra = '' }) {
     parts.push('', SECTION.tools, ...toolLines);
   }
 
-  // 自带的协议提示词：单独一个 system 块，放在 TOOL_FUNCTIONS 之后、USER 之前
-  parts.push('', SECTION.system, SPECIAL_TOKENS_HEADER.trim());
+  // 自带的协议提示词：单独一个 system 块，放在 TOOL_FUNCTIONS 之后、USER 之前。
+  // 没有工具声明时只放基础规则：网页端产不出 tool_calls，教 DSML 只会把 XML 标签写进 prompt。
+  const protocolText = (toolLines.length ? SPECIAL_TOKENS_HEADER : BASE_SYSTEM_RULES).trim();
+  parts.push('', SECTION.system, protocolText);
 
   for (const section of sections) {
     let body = section.lines.join('\n').trim();
@@ -131,6 +140,8 @@ export function buildPrompt({ messages, tools = [], systemExtra = '' }) {
   return {
     prompt,
     systemTexts,
+    // 服务端自带的协议说明原文：上送前自检时这段是有意保留的（不算客户端污染）
+    protocolText,
     toolNames: collectToolNames(tools),
     stats: {
       chars: prompt.length,

@@ -1,6 +1,7 @@
 import { ApiError } from '../errors.mjs';
-import { collectImages } from '../openai/request.mjs';
+import { collectImages, mergeCounts } from '../openai/request.mjs';
 import { buildPrompt } from '../prompt/build.mjs';
+import { sanitizeMessages, sanitizeTools } from '../prompt/sanitize.mjs';
 import { estimateTokens } from '../util.mjs';
 
 /**
@@ -54,11 +55,34 @@ export function normalizeMessagesRequest(body, config) {
     });
   }
 
+  const stripped = { tools: 0, toolChoice: false };
+  let tools;
+  if (config.sanitize?.stripClientTools) {
+    // 网页端产不出 tool_calls：Anthropic 的 tools 同样默认整包丢弃
+    stripped.tools = Array.isArray(body.tools) ? body.tools.length : 0;
+    stripped.toolChoice = body.tool_choice !== undefined;
+    tools = [];
+  } else {
+    tools = normalizeTools(body.tools);
+  }
+
+  // 归一化阶段清掉 XML 协议标签：system / 对话历史 / tool_result / 工具定义
+  const enabled = config.sanitize?.markup !== false;
+  const cleaned = sanitizeMessages(messages, { enabled });
+  const cleanedTools = sanitizeTools(tools, { enabled });
+
   return {
     model,
-    messages,
+    messages: cleaned.messages,
     images: collectImages(messages),
-    tools: normalizeTools(body.tools),
+    tools: cleanedTools.tools,
+    sanitize: {
+      markup: {
+        count: cleaned.hits.count + cleanedTools.hits.count,
+        byName: mergeCounts(cleaned.hits.byName, cleanedTools.hits.byName),
+      },
+      stripped,
+    },
     stream: Boolean(body.stream),
     streamIncludeUsage: false,
     // 网页版不能调采样参数，这些字段接受但忽略，保持客户端兼容

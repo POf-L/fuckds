@@ -103,6 +103,16 @@ export function loadConfig(env = process.env) {
     },
     // 默认 auto：有协议凭据先走 protocol（纯 HTTP，不拉起浏览器），否则 direct / browser
     engine: str(env.ENGINE, 'auto'),
+    // 上送 prompt 前的协议标签清洗（网页端会把 XML 协议标签当风控信号）
+    sanitize: {
+      // 客户端传入的 tools / tool_choice 默认整包丢弃：网页端本来就产不出 tool_calls，
+      // 留着只会把工具定义写进 prompt，既没用又放大风控面。实验时可显式关掉。
+      stripClientTools: bool(env.STRIP_CLIENT_TOOLS, true),
+      // 对 system / user / assistant / 工具结果 / 附件名做 XML 协议标签清洗
+      markup: bool(env.SANITIZE_MARKUP, true),
+      // 上送前自检：拼好的 prompt 里一旦仍有协议标签就拒绝发送（不静默带出）
+      rejectOnHit: bool(env.SANITIZE_REJECT_ON_HIT, true),
+    },
     direct: {
       powBin: path.resolve(ROOT, expandHome(str(env.POW_BIN, 'bin/ds-pow'))),
     },

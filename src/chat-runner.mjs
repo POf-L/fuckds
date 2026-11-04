@@ -9,6 +9,7 @@ import {
 } from './openai/tool-text.mjs';
 import { buildPrompt } from './prompt/build.mjs';
 import { planOverflow } from './prompt/overflow.mjs';
+import { assertNoProtocolTags } from './prompt/sanitize.mjs';
 import { parseToolCalls } from './prompt/tools.mjs';
 
 /**
@@ -30,11 +31,24 @@ export function createChatRunner({ config, log, web }) {
   return async function runChat(request, { signal, meta = {}, onPrompt, onContent, onReasoning } = {}) {
     const { maxPromptChars, maxAttachmentChars, overflowToAttachment } = config.runtime;
 
+    /**
+     * 上送前风控自检：拼好的 prompt（含附件正文）里只要还有 XML 协议标签，就拒绝发送。
+     * 宁可报错也不静默带出去 —— 静默带出去等于把风控信号交给对方，且无任何证据留痕。
+     */
+    const guard = (plan, protocolText) => {
+      if (config.sanitize?.rejectOnHit === false) return;
+      // 服务端自带的协议说明是有意保留的（只在显式保留客户端 tools 时出现），不算污染
+      assertNoProtocolTags(plan.prompt, 'prompt', { allow: [protocolText] });
+      if (plan.attachment) assertNoProtocolTags(plan.attachment.buffer.toString('utf8'), '附件');
+    };
+
     /** 拼 prompt；超过输入框上限时把较早的段落拆成附件 */
     const prepare = (systemExtra = '') => {
       const built = buildPrompt({ messages: request.messages, tools: request.tools, systemExtra });
-      if (!overflowToAttachment) return { built, prompt: built.prompt, attachment: null };
-      const plan = planOverflow(built.prompt, { maxChars: maxPromptChars, maxAttachmentChars });
+      const plan = overflowToAttachment
+        ? planOverflow(built.prompt, { maxChars: maxPromptChars, maxAttachmentChars })
+        : { prompt: built.prompt, attachment: null };
+      guard(plan, built.protocolText);
       return { built, prompt: plan.prompt, attachment: plan.attachment };
     };
 
@@ -65,7 +79,7 @@ export function createChatRunner({ config, log, web }) {
     };
 
     const fileIds = [...imageIds, ...(await uploadAttachment(initial))];
-    onPrompt?.(prompt, { stats, attachment: initial.attachment });
+    onPrompt?.(prompt, { stats, attachment: initial.attachment, sanitize: request.sanitize });
 
     const knownTools = toolNames.length ? toolNames : null;
 
@@ -162,6 +176,7 @@ export function createChatRunner({ config, log, web }) {
         prompt,
         stats,
         attachment: initial.attachment,
+        sanitize: request.sanitize,
         text: result.text,
         reasoning: cleanReasoning(result.reasoning),
         elapsedMs: result.elapsedMs,
@@ -245,6 +260,7 @@ export function createChatRunner({ config, log, web }) {
       prompt,
       stats,
       attachment: initial.attachment,
+      sanitize: request.sanitize,
       text: authoritativeText,
       reasoning: finalReasoning,
       streamedContent: sentContent,

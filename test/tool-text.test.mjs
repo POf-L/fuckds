@@ -385,3 +385,41 @@ test('流式过滤器：半截段落标题（未写完）也先扣住', () => {
     assert.match(out, /后面的正文/);
   }
 });
+
+/* ------------------------------------------------------------------ *
+ * 输出侧兜底：<tool_call> / <function_calls> / <antml:*> 也不能回给客户端
+ * ------------------------------------------------------------------ */
+
+test('stripToolMarkup: 带属性的 <tool_call> 整块剔除，正文保留', () => {
+  const text = '我先执行\n<tool_call id="call_1">{"name":"bash","arguments":{"command":"ls"}}</tool_call>\n执行完毕';
+  const cleaned = stripToolMarkup(text);
+  assert.ok(!cleaned.includes('<tool_call'), cleaned);
+  assert.ok(!cleaned.includes('"command"'), `调用参数漏进 content: ${cleaned}`);
+  assert.match(cleaned, /我先执行/);
+  assert.match(cleaned, /执行完毕/);
+});
+
+test('stripToolMarkup: <function_calls>/<antml:invoke> 整块剔除，正文保留', () => {
+  const text = '开始\n<function_calls>\n<antml:invoke name="read_file">\n<antml:parameter name="path">README.md</antml:parameter>\n</antml:invoke>\n</function_calls>\n结束';
+  const cleaned = stripToolMarkup(text);
+  assert.ok(!cleaned.includes('<function_calls'), cleaned);
+  assert.ok(!cleaned.includes('<antml'), cleaned);
+  assert.ok(!cleaned.includes('README.md'), `调用参数漏进 content: ${cleaned}`);
+  assert.match(cleaned, /开始/);
+  assert.match(cleaned, /结束/);
+  // 残留的零散协议标签也要剥掉（模型偶尔只写半截）
+  assert.equal(stripToolMarkup('答案 <parameter name="x">'), '答案');
+});
+
+test('流式过滤器：半截 <antml:invoke 被任意切段时不会漏进 content', () => {
+  const text = '看一下\n<antml:invoke name="read_file"><parameter name="path">a.txt</parameter></antml:invoke>\n好了';
+  const expected = squeeze(stripToolMarkup(text));
+  for (let cut = 1; cut < text.length; cut += 1) {
+    const filter = new ToolMarkupStreamFilter();
+    let out = filter.push(text.slice(0, cut));
+    out += filter.push(text.slice(cut));
+    out += filter.flushRest();
+    assert.ok(!out.includes('<antml'), `split@${cut} 漏了协议标签: ${JSON.stringify(out)}`);
+    assert.equal(squeeze(out), expected, `split@${cut} 内容不对: ${JSON.stringify(out)}`);
+  }
+});

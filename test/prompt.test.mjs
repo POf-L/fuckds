@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 
 import { buildPrompt } from '../src/prompt/build.mjs';
-import { SECTION, SPECIAL_TOKENS_HEADER } from '../src/prompt/special.mjs';
+import { BASE_SYSTEM_RULES, SECTION, SPECIAL_TOKENS_HEADER } from '../src/prompt/special.mjs';
 
 test('单轮：system + user，按 ## 段落拼接', () => {
   const { prompt } = buildPrompt({
@@ -13,7 +13,8 @@ test('单轮：system + user，按 ## 段落拼接', () => {
   });
 
   assert.ok(prompt.startsWith('# Messages:\n## System:\n'));
-  assert.ok(prompt.includes(SPECIAL_TOKENS_HEADER.trim()));
+  // 没有工具声明时只拼基础规则（不教 DSML，避免把 XML 协议标签写进 prompt）
+  assert.ok(prompt.includes(BASE_SYSTEM_RULES.trim()));
   assert.ok(prompt.includes('你是一个简洁的助手'));
   assert.ok(prompt.includes('## User:\n你好'));
   assert.ok(!prompt.includes('## Assistant:'));
@@ -160,7 +161,7 @@ test('systemExtra 追加在 SYSTEM 段末尾（协议提示词之前）', () => 
     messages: [{ role: 'user', content: '你好' }],
     systemExtra: '额外约束：不要输出 RESULT。',
   });
-  assert.ok(prompt.indexOf('额外约束：不要输出 RESULT。') < prompt.indexOf(SPECIAL_TOKENS_HEADER.trim()));
+  assert.ok(prompt.indexOf('额外约束：不要输出 RESULT。') < prompt.indexOf(BASE_SYSTEM_RULES.trim()));
   assert.ok(prompt.indexOf('额外约束') < prompt.indexOf('## User:'));
 });
 

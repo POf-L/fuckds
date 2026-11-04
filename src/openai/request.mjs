@@ -1,4 +1,5 @@
 import { ApiError } from '../errors.mjs';
+import { sanitizeMessages, sanitizeTools } from '../prompt/sanitize.mjs';
 
 const SUPPORTED_ROLES = new Set(['system', 'developer', 'user', 'assistant', 'tool']);
 
@@ -26,25 +27,48 @@ export function normalizeChatRequest(body, config) {
 
   const model = typeof body.model === 'string' && body.model.trim() ? body.model.trim() : config.deepseek.defaultModel;
 
-  const tools = Array.isArray(body.tools) ? body.tools : [];
-  for (const [i, tool] of tools.entries()) {
-    const fn = tool?.function ?? tool;
-    if (!fn || typeof fn.name !== 'string') {
-      throw new ApiError(400, `tools[${i}] 缺少 function.name`, {
-        code: 'invalid_tools',
-        param: `tools[${i}]`,
-      });
+  const incomingTools = Array.isArray(body.tools) ? body.tools : [];
+  const stripped = { tools: 0, toolChoice: false };
+  let tools = incomingTools;
+
+  if (config.sanitize?.stripClientTools) {
+    // 网页端产不出 tool_calls：工具定义只会把 XML / JSON 协议写进 prompt，默认整包丢弃
+    stripped.tools = incomingTools.length;
+    stripped.toolChoice = body.tool_choice !== undefined;
+    tools = [];
+  } else {
+    for (const [i, tool] of incomingTools.entries()) {
+      const fn = tool?.function ?? tool;
+      if (!fn || typeof fn.name !== 'string') {
+        throw new ApiError(400, `tools[${i}] 缺少 function.name`, {
+          code: 'invalid_tools',
+          param: `tools[${i}]`,
+        });
+      }
     }
   }
+
+  // 在归一化阶段清掉 XML 协议标签：所有会进 prompt 的文本都过一遍
+  const sanitizeEnabled = config.sanitize?.markup !== false;
+  const cleaned = sanitizeMessages(messages, { enabled: sanitizeEnabled });
+  const cleanedTools = sanitizeTools(tools, { enabled: sanitizeEnabled });
+  const sanitize = {
+    markup: {
+      count: cleaned.hits.count + cleanedTools.hits.count,
+      byName: mergeCounts(cleaned.hits.byName, cleanedTools.hits.byName),
+    },
+    stripped,
+  };
 
   const stream = Boolean(body.stream);
   const streamIncludeUsage = Boolean(body.stream_options?.include_usage);
 
   return {
     model,
-    messages,
+    messages: cleaned.messages,
     images: collectImages(messages),
-    tools,
+    tools: cleanedTools.tools,
+    sanitize,
     stream,
     streamIncludeUsage,
     // 网页版不能调采样参数，这些字段接受但忽略，保持客户端兼容
@@ -54,6 +78,13 @@ export function normalizeChatRequest(body, config) {
     thinking: resolveThinking(body, model, config),
     search: body.search === undefined ? config.deepseek.search : Boolean(body.search),
   };
+}
+
+/** 合并两份命中统计（只累加数量与标签名） */
+export function mergeCounts(a = {}, b = {}) {
+  const out = { ...a };
+  for (const [name, n] of Object.entries(b)) out[name] = (out[name] ?? 0) + n;
+  return out;
 }
 
 const MAX_IMAGES = 8;
@@ -92,13 +123,18 @@ export function normalizeCompletionRequest(body, config) {
   if (!body || typeof body !== 'object') {
     throw new ApiError(400, '请求体必须是 JSON 对象', { code: 'invalid_body' });
   }
-  const prompt = typeof body.prompt === 'string' ? body.prompt : Array.isArray(body.prompt) ? body.prompt.join('\n') : '';
-  if (!prompt) throw new ApiError(400, '缺少 prompt 字段', { code: 'invalid_prompt', param: 'prompt' });
+  const rawPrompt = typeof body.prompt === 'string' ? body.prompt : Array.isArray(body.prompt) ? body.prompt.join('\n') : '';
+  if (!rawPrompt) throw new ApiError(400, '缺少 prompt 字段', { code: 'invalid_prompt', param: 'prompt' });
+
+  const cleaned = sanitizeMessages([{ role: 'user', content: rawPrompt }], {
+    enabled: config.sanitize?.markup !== false,
+  });
 
   return {
     model: typeof body.model === 'string' && body.model.trim() ? body.model.trim() : config.deepseek.defaultModel,
-    messages: [{ role: 'user', content: prompt }],
+    messages: cleaned.messages,
     tools: [],
+    sanitize: { markup: cleaned.hits, stripped: { tools: 0, toolChoice: false } },
     stream: Boolean(body.stream),
     streamIncludeUsage: false,
     ignored: [],

@@ -31,6 +31,10 @@ export function createAnthropicHandler({ config, log, runChat, sendJson }) {
         attachmentChars: info.attachment?.chars ?? 0,
         sections: info.stats?.sections,
         tools: info.stats?.tools,
+        toolsDropped: info.sanitize?.stripped?.tools ?? 0,
+        toolChoiceDropped: info.sanitize?.stripped?.toolChoice ?? false,
+        markupHits: info.sanitize?.markup?.count ?? 0,
+        markupTags: info.sanitize?.markup?.byName ?? {},
       });
 
     if (!request.stream) {

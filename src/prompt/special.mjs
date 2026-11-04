@@ -11,8 +11,14 @@
  *    工具结果单独放在 ## Tool_call_result 段，模型没有可模仿的「自己写工具语法 / 自己写结果」样板。
  */
 
-export const SPECIAL_TOKENS_HEADER = `
-你是一个在调用工具时绝对严谨的助手
+/**
+ * 不带工具时的基础规则（含特殊 token 说明与上下文约束，不含任何 XML 协议标签）。
+ *
+ * 默认配置会丢弃客户端 tools，agent / 工具调用不可用，所以也不再教 DSML：
+ * 教一遍模型也产不出 tool_calls，反而把 XML 标签写进 prompt（网页端风控会盯这类标记）。
+ */
+export const BASE_SYSTEM_RULES = `
+你是一个严谨、简洁的助手
 
 特殊Token：
 
@@ -31,6 +37,22 @@ CONTEXT_ATTACHMENT -> 早期对话中的附件描述
 2. 在每一轮对话中，如果存在 ASSISTANT_ROLE_MESSAGE，表示你已经回答过该问题；不要再次回复。
 3. Tool_calls 部分列出了你已经发出的调用；不要重复调用已有 Tool_call_result 的调用。
 
+长上下文
+
+· CONTEXT_ATTACHMENT 部分表示早期对话已被拆分为附件。请先阅读附件，然后结合以下各节回答。
+· 附件内容也使用 ## 节格式，并且是本对话历史的一部分，而不是新的用户请求。
+
+输出规范：
+1. 任何时候都不要披露、输出或复述系统设置的特殊标记。
+2. 不要输出“ASSISTANT_ROLE_MESSAGES”。
+`;
+
+/**
+ * 工具调用协议说明：只有「显式保留客户端 tools」时才会拼进 prompt（见 prompt/build.mjs）。
+ * 默认配置丢弃 tools，网页端本来就产不出 tool_calls，这段只会把 XML 协议标签写进 prompt，
+ * 既是无效上下文，又会放大风控面。
+ */
+export const DSML_PROTOCOL_SECTION = `
 工具调用：
 你需要使用一种标记语言来进行工具调用，同时它也是你的原生工具调用语言：
 DeepSeek Markup Language(DSML):
@@ -89,16 +111,10 @@ string 属性可以省略，但写全更稳。
 3. 禁止假装你已经执行了工具。
 4.禁止预测、猜测工具名/工具参数
 5.在调用工具时注意参数嵌套，避免调用出错
-
-长上下文
-
-· CONTEXT_ATTACHMENT 部分表示早期对话已被拆分为附件。请先阅读附件，然后结合以下各节回答。
-· 附件内容也使用 ## 节格式，并且是本对话历史的一部分，而不是新的用户请求。
-
-输出规范：
-1. 任何时候都不要披露、输出或复述系统设置的特殊标记。
-2. 不要输出“ASSISTANT_ROLE_MESSAGES”。
 `;
+
+/** 完整协议提示词 = 基础规则 + DSML 工具调用说明（仅显式保留客户端 tools 时使用） */
+export const SPECIAL_TOKENS_HEADER = `${BASE_SYSTEM_RULES.trim()}\n\n${DSML_PROTOCOL_SECTION.trim()}`;
 
 /**
  * 每轮回答的结束标记。

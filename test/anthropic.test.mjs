@@ -158,7 +158,7 @@ test('Anthropic tools：tool_use 块 + input 是对象，stop_reason=tool_use', 
   const web = fakeWeb({
     toolText: '先看内核：\n<｜DSML｜ calls>\n<｜DSML｜ invoke name="exec_shell">\n<｜DSML｜ parameter name="command" string="true">uname -a</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>',
   });
-  await withServer({ web }, async (base) => {
+  await withServer({ web, env: { STRIP_CLIENT_TOOLS: 'false' } }, async (base) => {
     const res = await post(
       base,
       '/v1/messages',
@@ -193,7 +193,7 @@ test('Anthropic tools：tool_use 块 + input 是对象，stop_reason=tool_use', 
 
 test('Anthropic：tool_use / tool_result 历史转换成 Tool_calls + Tool_call_result 段', async () => {
   const web = fakeWeb({ answer: '内核是 6.1。' });
-  await withServer({ web }, async (base) => {
+  await withServer({ web, env: { STRIP_CLIENT_TOOLS: 'false' } }, async (base) => {
     const res = await post(
       base,
       '/v1/messages',

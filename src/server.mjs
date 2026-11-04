@@ -158,6 +158,11 @@ export function createServer({ config, logger, web }) {
         attachmentChars: info.attachment?.chars ?? 0,
         sections: info.stats?.sections,
         tools: info.stats?.tools,
+        // 清洗审计：只记数量与标签名，绝不记正文
+        toolsDropped: info.sanitize?.stripped?.tools ?? 0,
+        toolChoiceDropped: info.sanitize?.stripped?.toolChoice ?? false,
+        markupHits: info.sanitize?.markup?.count ?? 0,
+        markupTags: info.sanitize?.markup?.byName ?? {},
       });
 
     if (!request.stream) {
