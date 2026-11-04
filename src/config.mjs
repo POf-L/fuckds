@@ -257,10 +257,14 @@ export function loadConfig(env = process.env) {
       // 账号被限流后的冷却时间，以及请求最多愿意等多久
       accountCooldownMs: int(env.ACCOUNT_COOLDOWN_MS, 60_000),
       maxCooldownWaitMs: int(env.MAX_COOLDOWN_WAIT_MS, 5_000),
+      // 上游「user is muted」的账号冷却。实测 00:30 首次禁言后，00:45（15 分钟）
+      // 仍然禁言；10 分钟会过早探测一次，故默认 15 分钟。
+      mutedCooldownMs: int(env.MUTED_COOLDOWN_MS, 15 * 60_000),
       // 单账号最小请求间隔（毫秒）：在「单账号串行」之外再加一层节奏限制。
-      // 默认 3000：浏览器引擎的 SEND_INTERVAL_MS 保守值是 4000（网页会提示“发送过于频繁”），
-      // 协议通道没有 UI 输入耗时，取 0.75 倍保守值留出余量；设 0 可关闭。
-      accountMinGapMs: int(env.ACCOUNT_MIN_GAP_MS, 3_000),
+      // 实测 2026-11-04 19:28：间隔中位数 2.2s、峰值 27 条/97s（≈3.6s 平均）时
+      // 触发 429。默认 8000 把稳态压到 ≤7.5 条/分钟，约为失败阈值的 1/2；
+      // 设 0 可关闭（不建议）。
+      accountMinGapMs: int(env.ACCOUNT_MIN_GAP_MS, 8_000),
       // 首段正文最多等多久思考内容（毫秒），保证 reasoning 一定排在 content 前面
       reasoningHoldMs: int(env.REASONING_HOLD_MS, 900),
       rateLimitBackoffMs: int(env.RATE_LIMIT_BACKOFF_MS, 4000),

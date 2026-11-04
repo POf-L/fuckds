@@ -34,8 +34,11 @@ export const AUTH_INVALID_COOLDOWN_MS = 24 * 60 * 60_000;
  * 上游「账号被禁言」：实测 2026-11-05 登录态有效但网页接口返回
  * HTTP 502 / message="user is muted"。这是账号级风控，不是凭据失效：
  * 重新登录 / 重开浏览器都不会恢复，反而会浪费登录态，所以按限流冷却处理。
+ *
+ * 默认 15 分钟（实测 00:30 禁言后，00:45 仍禁言；10 分钟会过早探测）。
+ * 运行期可用 MUTED_COOLDOWN_MS 覆盖。
  */
-export const MUTED_COOLDOWN_MS = 10 * 60_000;
+export const MUTED_COOLDOWN_MS = 15 * 60_000;
 
 export function isMutedMessage(message) {
   return /user\s+is\s+muted|账号.{0,8}禁言|账户.{0,8}禁言/i.test(String(message || ''));
@@ -529,7 +532,7 @@ export class DirectEngine {
           if (isMutedMessage(message)) {
             throw new RateLimitError(
               `DeepSeek 上游提示账号被禁言（${message}）：这是账号级风控，不是登录态失效，重新登录/重开浏览器无效`,
-              { retryAfterMs: MUTED_COOLDOWN_MS },
+              { retryAfterMs: this.config.runtime.mutedCooldownMs },
             );
           }
           if (res.status === 429 || /频繁|rate/i.test(message)) throw new RateLimitError(message);
@@ -789,7 +792,7 @@ export class DirectEngine {
       const message = body?.msg || body?.data?.biz_msg || `HTTP ${res.status}`;
       if (isMutedMessage(message)) {
         throw new RateLimitError(`上游提示账号被禁言（${message}）：账号级风控，稍后重试`, {
-          retryAfterMs: MUTED_COOLDOWN_MS,
+          retryAfterMs: this.config.runtime.mutedCooldownMs,
         });
       }
       if (res.status === 429 || /频繁/.test(message)) throw new RateLimitError(message);
@@ -847,7 +850,7 @@ export class DirectEngine {
       const message = body?.msg || body?.data?.biz_msg || `HTTP ${res.status}`;
       if (isMutedMessage(message)) {
         throw new RateLimitError(`上游提示账号被禁言（${message}）：账号级风控，稍后重试`, {
-          retryAfterMs: MUTED_COOLDOWN_MS,
+          retryAfterMs: this.config.runtime.mutedCooldownMs,
         });
       }
       if (res.status === 429 || /频繁/.test(message)) throw new RateLimitError(message);
