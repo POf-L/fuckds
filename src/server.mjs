@@ -138,6 +138,9 @@ export function createServer({ config, logger, web }) {
       const apiError = err instanceof ApiError ? err : new ApiError(500, err.message);
       if (!(err instanceof ApiError)) log.error('请求处理失败:', err);
       if (apiError.status >= 500 || apiError.status === 429) log.warn('上游失败:', err.message);
+      if (apiError.code === 'deepseek_auth_required') {
+        log.warn('登录态失效：请运行 `npm run auth:hybrid` 重新登录（使用手册 §6；无需手动复制 token）');
+      }
       if (apiError.status === 429) {
         const seconds = Math.ceil((err.retryAfterMs ?? 60_000) / 1000);
         res.setHeader('Retry-After', String(seconds));

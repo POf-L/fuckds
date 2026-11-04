@@ -105,9 +105,56 @@ export function saveCredentials(file, creds) {
 }
 
 /**
- * 打开 hybrid profile 采集凭据。耗时约 5-7 秒（浏览器冷启动 + 页面加载），
- * 结束立即关闭；之后协议请求不再依赖浏览器。
+ * 从已经打开的页面/上下文提取协议凭据（不发请求、不导航）。
+ * 同时供 harvestCredentials 与 scripts/login-hybrid.mjs 复用，避免两套解析逻辑漂移。
  */
+export async function extractCredentialsFromContext(ctx, page, startedAt = Date.now()) {
+  const local = await page.evaluate(() => {
+    const unwrap = (key) => {
+      const raw = localStorage.getItem(key);
+      if (!raw) return '';
+      try {
+        const parsed = JSON.parse(raw);
+        if (typeof parsed === 'string') return parsed;
+        if (parsed && typeof parsed === 'object' && typeof parsed.value === 'string') {
+          return parsed.value;
+        }
+        return raw;
+      } catch {
+        return raw;
+      }
+    };
+    return {
+      userToken: unwrap('userToken'),
+      deviceId: localStorage.getItem('deepseek-device-id:chat') || '',
+      hifLeim: unwrap('hif_leim_cached'),
+      hifDliq: unwrap('hif_dliq_cached'),
+      userAgent: navigator.userAgent,
+      languages: navigator.languages,
+      platform: navigator.platform,
+      brands: navigator.userAgentData?.brands || [],
+      mobile: navigator.userAgentData?.mobile ?? false,
+    };
+  });
+  const cookies = await ctx.cookies('https://chat.deepseek.com');
+  const record = {
+    ...local,
+    cookies: cookies.map((c) => ({
+      name: c.name,
+      value: c.value,
+      httpOnly: c.httpOnly,
+      secure: c.secure,
+      sameSite: c.sameSite,
+      domain: c.domain,
+      expires: c.expires,
+    })),
+    harvestedAt: Date.now(),
+    harvestMs: Date.now() - startedAt,
+  };
+  record.cookieHeader = cookieHeaderFrom(record.cookies);
+  return record;
+}
+
 export async function harvestCredentials({ config, logger, waitMs = config.protocol?.harvestWaitMs ?? 2500 }) {
   const startedAt = Date.now();
   const ctx = await chromium.launchPersistentContext(config.hybrid.profileDir, {
@@ -122,49 +169,7 @@ export async function harvestCredentials({ config, logger, waitMs = config.proto
       .waitForFunction(() => Boolean(localStorage.getItem('userToken')), { timeout: 15000 })
       .catch(() => {});
     if (waitMs > 0) await page.waitForTimeout(waitMs);
-    const local = await page.evaluate(() => {
-      const unwrap = (key) => {
-        const raw = localStorage.getItem(key);
-        if (!raw) return '';
-        try {
-          const parsed = JSON.parse(raw);
-          if (typeof parsed === 'string') return parsed;
-          if (parsed && typeof parsed === 'object' && typeof parsed.value === 'string') {
-            return parsed.value;
-          }
-          return raw;
-        } catch {
-          return raw;
-        }
-      };
-      return {
-        userToken: unwrap('userToken'),
-        deviceId: localStorage.getItem('deepseek-device-id:chat') || '',
-        hifLeim: unwrap('hif_leim_cached'),
-        hifDliq: unwrap('hif_dliq_cached'),
-        userAgent: navigator.userAgent,
-        languages: navigator.languages,
-        platform: navigator.platform,
-        brands: navigator.userAgentData?.brands || [],
-        mobile: navigator.userAgentData?.mobile ?? false,
-      };
-    });
-    const cookies = await ctx.cookies('https://chat.deepseek.com');
-    const record = {
-      ...local,
-      cookies: cookies.map((c) => ({
-        name: c.name,
-        value: c.value,
-        httpOnly: c.httpOnly,
-        secure: c.secure,
-        sameSite: c.sameSite,
-        domain: c.domain,
-        expires: c.expires,
-      })),
-      harvestedAt: Date.now(),
-      harvestMs: Date.now() - startedAt,
-    };
-    record.cookieHeader = cookieHeaderFrom(record.cookies);
+    const record = await extractCredentialsFromContext(ctx, page, startedAt);
     if (!record.userToken) throw new Error('profile 里没有 userToken');
     if (!hasLoginMarker(record)) {
       throw new Error('profile 里只有匿名 guest token（缺 hif 缓存），不是登录态，拒绝缓存');

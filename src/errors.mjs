@@ -1,3 +1,21 @@
+/** 凭据失效时给客户端/用户的可执行动作（不要只丢一个 INVALID_TOKEN） */
+export const AUTH_NEXT_ACTION = Object.freeze({
+  action: 're-login',
+  command: 'npm run auth:hybrid',
+  doc: '使用手册 §6',
+});
+
+const AUTH_GUIDANCE = '请重新登录：npm run auth:hybrid';
+
+function authGuidanceOf(err) {
+  return err?.code === 'deepseek_auth_required' ? AUTH_NEXT_ACTION : null;
+}
+
+function authMessage(err, message) {
+  if (!authGuidanceOf(err)) return message;
+  return message.includes('auth:hybrid') ? message : `${message}。${AUTH_GUIDANCE}（使用手册 §6）`;
+}
+
 /** OpenAI 兼容的错误对象 */
 export class ApiError extends Error {
   constructor(status, message, { type = 'invalid_request_error', code = null, param = null } = {}) {
@@ -10,7 +28,16 @@ export class ApiError extends Error {
   }
 
   toJSON() {
-    return { error: { message: this.message, type: this.type, param: this.param, code: this.code } };
+    const nextAction = authGuidanceOf(this);
+    return {
+      error: {
+        message: authMessage(this, this.message),
+        type: this.type,
+        param: this.param,
+        code: this.code,
+        ...(nextAction ? { nextAction } : {}),
+      },
+    };
   }
 }
 
@@ -29,7 +56,7 @@ export class UpstreamError extends ApiError {
 
 export class AuthExpiredError extends UpstreamError {
   constructor(
-    message = 'DeepSeek 登录态无效或已过期，请重新执行 `npm run auth -- <userToken>` 写入 token',
+    message = 'DeepSeek 登录态无效或已过期。请重新登录：npm run auth:hybrid（使用手册 §6）',
   ) {
     // 凭据失效必须是 401：客户端要能据此重新登录，而不是当成上游 5xx 无脑重试。
     // code 保持 deepseek_auth_required，方便日志/监控按 code 聚合。

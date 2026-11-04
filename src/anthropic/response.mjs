@@ -1,5 +1,6 @@
 import crypto from 'node:crypto';
 
+import { AUTH_NEXT_ACTION } from '../errors.mjs';
 import { estimateTokens } from '../util.mjs';
 
 export const newMessageId = () => `msg_${crypto.randomBytes(12).toString('hex')}`;
@@ -83,5 +84,12 @@ export function anthropicErrorPayload(err) {
                 : status >= 500
                   ? 'api_error'
                   : 'invalid_request_error';
-  return { type: 'error', error: { type, message: err?.message || 'internal error' } };
+  const isAuth = err?.code === 'deepseek_auth_required';
+  const message = isAuth && !String(err?.message || '').includes('auth:hybrid')
+    ? `${err?.message || '登录态失效'}。请重新登录：npm run auth:hybrid（使用手册 §6）`
+    : err?.message || 'internal error';
+  return {
+    type: 'error',
+    error: { type, message, ...(isAuth ? { nextAction: AUTH_NEXT_ACTION } : {}) },
+  };
 }

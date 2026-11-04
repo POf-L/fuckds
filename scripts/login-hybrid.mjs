@@ -16,6 +16,12 @@ import path from 'node:path';
 import { chromium } from 'playwright';
 
 import { CONFIG_ROOT, loadConfig } from '../src/config.mjs';
+import { fingerprintOf } from '../src/direct/account-pool.mjs';
+import {
+  extractCredentialsFromContext,
+  hasLoginMarker,
+  saveCredentials,
+} from '../src/protocol/credentials.mjs';
 
 const args = process.argv.slice(2);
 const fromCdpIdx = args.indexOf('--from-cdp');
@@ -88,27 +94,50 @@ if (fromCdp) {
 } else {
   console.log(`打开独立 profile：${profileDir}`);
   console.log('请在打开的浏览器里登录 https://chat.deepseek.com（脚本会等待登录完成，最多 10 分钟）');
+  console.log('完成后会自动把凭据写入 data/（0600），无需手动复制 token。');
   const persistent = await launch();
   let ok = false;
+  let saved = null;
   try {
     const page = persistent.pages()[0] || (await persistent.newPage());
-    await page.goto(`${config.browser.baseUrl || 'https://chat.deepseek.com'}/`, {
+    await page.goto(`${config.browser.baseUrl || 'https://chat.deepseek.com'}/sign_in`, {
       waitUntil: 'domcontentloaded',
       timeout: 60_000,
     });
     const deadline = Date.now() + 10 * 60_000;
     while (Date.now() < deadline) {
-      if (await signedIn(page)) {
+      const token = await signedIn(page);
+      const url = page.url();
+      // 判据：拿到登录 token，且页面已离开 /sign_in（游客态也会带 token，所以必须同时看 URL）
+      if (token && !url.includes('/sign_in')) {
         ok = true;
         break;
       }
-      await new Promise((resolve) => setTimeout(resolve, 3_000));
+      await new Promise((resolve) => setTimeout(resolve, 2_500));
     }
     if (ok) {
-      await page.waitForTimeout(3_000); // 给 localStorage/cookie 落盘
-      console.log('登录完成，登录态已写入 profile；之后 hybrid 会冷启动复用。');
+      // 等 hif 缓存落盘（登录后页面会异步写入，否则只能拿到匿名 guest token）
+      let creds = null;
+      for (let i = 0; i < 8; i += 1) {
+        await page.waitForTimeout(1_500);
+        const record = await extractCredentialsFromContext(persistent, page);
+        if (hasLoginMarker(record)) {
+          creds = record;
+          break;
+        }
+      }
+      if (!creds) {
+        console.error('登录成功但未拿到 hif 缓存（可能是匿名态）。凭据未写入，请保持页面打开后重新运行。');
+        ok = false;
+      } else {
+        const file = config.protocol.credentialsFile;
+        saveCredentials(file, creds);
+        saved = { file, hash: fingerprintOf(creds.userToken).slice(0, 12), ageMs: Date.now() - creds.harvestedAt };
+        console.log(`登录成功，凭据已写入 ${file}（0600，哈希前缀 ${saved.hash}）`);
+        console.log('登录态同时保存在 profile 中；hybrid 层可复用。');
+      }
     } else {
-      console.error('等待超时：没有在 localStorage 里检测到 userToken，profile 未就绪。');
+      console.error('未检测到登录，稍后可重新运行 `npm run auth:hybrid`。');
     }
   } finally {
     await persistent.close();

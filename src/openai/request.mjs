@@ -125,6 +125,12 @@ export function collectImages(messages = []) {
 
 function resolveThinking(body, model, config) {
   if (body.thinking !== undefined) return Boolean(body.thinking);
+  // OpenAI 的 reasoning_effort：DeepSeek 网页只有「深度思考 开/关」，没有 low/medium/high 分档。
+  // 约定 none/off = 关闭，其余档位一律视为打开（不伪造多档差异）。
+  if (typeof body.reasoning_effort === 'string') {
+    const effort = body.reasoning_effort.trim().toLowerCase();
+    return effort !== 'none' && effort !== 'off';
+  }
   if (config.deepseek.thinking === 'always') return true;
   if (config.deepseek.thinking === 'never') return false;
 
