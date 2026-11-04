@@ -104,6 +104,52 @@ test('plan：TTL 过期与重启后恢复', () => {
   assert.equal(again.entry.chatSessionId, 'sess-4');
 });
 
+test('TTL 过期：不再复用，按新建会话处理而不是报错', () => {
+  const { store } = tmpStore({ ttlMs: 60_000 });
+  const first = store.plan([SYSTEM, USER1]);
+  store.commit(first.key, { chatSessionId: 'sess-ttl', lastMessageId: 'msg-ttl', sentHashes: first.hashes });
+
+  const expiredAt = Date.now() - 10 * 60_000;
+  store.entries.get(first.key).updatedAt = expiredAt;
+  const again = store.plan([SYSTEM, USER1, ASSISTANT1, { role: 'user', content: '继续' }]);
+  assert.equal(again.reuse, false);
+  assert.equal(again.reason, 'expired');
+  assert.equal(again.entry, null);
+  assert.equal(store.entries.has(first.key), false);
+});
+
+test('LRU：超过 maxEntries 淘汰最久未用，淘汰后自动重建', async () => {
+  const { store } = tmpStore({ maxEntries: 2, ttlMs: 60_000 });
+  for (const id of ['conv-a', 'conv-b', 'conv-c']) {
+    const plan = store.plan([SYSTEM, { role: 'user', content: id }], id);
+    store.commit(plan.key, { chatSessionId: `sess-${id}`, lastMessageId: `msg-${id}`, sentHashes: plan.hashes });
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  assert.equal(store.entries.size, 2);
+  const planA = store.plan([SYSTEM, { role: 'user', content: 'conv-a' }], 'conv-a');
+  assert.equal(planA.reuse, false);
+  assert.equal(planA.reason, 'new-conversation');
+  const planC = store.plan([SYSTEM, { role: 'user', content: 'conv-c' }], 'conv-c');
+  assert.equal(planC.reuse, true);
+});
+
+test('压缩后历史被替换：判定 history-diverged，不串回旧网页会话', () => {
+  const { store } = tmpStore();
+  const original = [SYSTEM, { role: 'user', content: '很早以前的长对话' }];
+  const first = store.plan(original, { conversationId: 'conv-compacted' });
+  store.commit(first.key, { chatSessionId: 'sess-before-compact', lastMessageId: 'msg-before', sentHashes: first.hashes });
+
+  // opencode 压缩后：system 变成摘要，历史被大幅删减
+  const compacted = [
+    { role: 'system', content: '【历史摘要】之前聊过长对话。' },
+    { role: 'user', content: '继续。' },
+  ];
+  const plan = store.plan(compacted, { conversationId: 'conv-compacted' });
+  assert.equal(plan.reuse, false);
+  assert.equal(plan.reason, 'history-diverged');
+  assert.equal(plan.entry.chatSessionId, 'sess-before-compact');
+});
+
 test('buildDeltaPrompt：只渲染增量，不重放 system/工具声明', () => {
   const messages = [SYSTEM, USER1, ASSISTANT1, { role: 'user', content: '继续' }];
   const delta = buildDeltaPrompt({ messages, from: 3 });

@@ -322,10 +322,21 @@ export function createServer({ config, logger, web }) {
       sse.done();
     } catch (err) {
       if (res.writableEnded || sse.closed) return;
-      const payload = (err instanceof ApiError ? err : new ApiError(500, err.message)).toJSON();
-      sse.send(payload);
+      const apiError = err instanceof ApiError ? err : new ApiError(500, err.message);
+      // 还没发出任何 SSE 字节时，按真实 HTTP 状态返回 JSON。
+      // 否则 200 + 只有 error 帧的空流会被客户端当成「模型空回答」立刻重试，
+      // 限流期间会变成高频空转（实测 opencode 会在 60 秒冷却里连打十几次）。
+      if (!res.headersSent) {
+        if (apiError.status === 429) {
+          const seconds = Math.ceil((err.retryAfterMs ?? 60_000) / 1000);
+          res.setHeader('Retry-After', String(seconds));
+        }
+        if (!(err instanceof ApiError) || apiError.status >= 500) log.warn('流式失败:', err.message);
+        return sendJson(res, apiError.status, apiError.toJSON());
+      }
+      sse.send(apiError.toJSON());
       sse.done();
-      if (!(err instanceof ApiError) || err.status >= 500) log.warn('流式失败:', err.message);
+      if (!(err instanceof ApiError) || apiError.status >= 500) log.warn('流式失败:', err.message);
     }
   }
 

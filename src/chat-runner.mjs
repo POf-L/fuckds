@@ -77,10 +77,18 @@ export function createChatRunner({ config, log, web, sessions = null }) {
           from: sessionPlan.deltaFrom,
           toolNameById: collectToolNamesById(request.messages),
         });
-        const deltaPlan = overflowToAttachment
-          ? planOverflow(delta.prompt, { maxChars: maxPromptChars, maxAttachmentChars })
-          : { prompt: delta.prompt, attachment: null };
-        if (deltaPlan.prompt.length <= maxPromptChars) {
+        // 增量本身也可能是「一整条超大消息」，没有 ## 段落可拆，planOverflow 会抛 413。
+        // 这种情况应该退回全量新会话（全量 prompt 带段落标题，通常反而拆得动），而不是直接失败。
+        let deltaPlan = null;
+        try {
+          deltaPlan = overflowToAttachment
+            ? planOverflow(delta.prompt, { maxChars: maxPromptChars, maxAttachmentChars })
+            : { prompt: delta.prompt, attachment: null };
+        } catch (err) {
+          if (!(err instanceof PromptTooLongError)) throw err;
+          sessionPlan.reason = 'delta-too-long';
+        }
+        if (deltaPlan && deltaPlan.prompt.length <= maxPromptChars) {
           guard(deltaPlan, '');
           plan = deltaPlan;
           built = { ...full.built, prompt: deltaPlan.prompt, stats: delta.stats };

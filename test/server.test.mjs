@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 
 import { createServer } from '../src/server.mjs';
 import { createLogger } from '../src/logger.mjs';
+import { RateLimitError } from '../src/errors.mjs';
 import { makeConfig } from './helpers/browser.mjs';
 
 const logger = createLogger('error');
@@ -17,6 +18,8 @@ function fakeWeb({
   failOnCall = null,
   // 模拟浏览器 driver 的流式增量被截断：只吐 streamText，权威 text 仍是完整的
   streamText = null,
+  // 返回网页会话 id：用于验证会话复用路径
+  sessionIds = false,
 } = {}) {
   let call = 0;
   const web = {
@@ -43,7 +46,14 @@ function fakeWeb({
       for (let i = 0; i < emitted.length; i += 4) {
         if (onDelta?.(emitted.slice(i, i + 4)) === false) break;
       }
-      return { text, reasoning: reason, streamed: emitted, streamedReasoning: reason, elapsedMs: 10 };
+      return {
+        text,
+        reasoning: reason,
+        streamed: emitted,
+        streamedReasoning: reason,
+        elapsedMs: 10,
+        ...(sessionIds ? { chatSessionId: 'fake-web-session', messageId: `fake-msg-${web.calls}` } : {}),
+      };
     },
   };
   return web;
@@ -695,4 +705,72 @@ test('流式：原生 <|tool…|> token 不会出现在 content 增量里', asyn
     assert.equal(calls.length, 1);
     assert.equal(calls[0].function.name, 'exec_shell');
   });
+});
+
+// ------------------------------------------------ 流式首字节前失败必须用真实 HTTP 状态
+
+test('流式：首字节前限流 → 429 + Retry-After，而不是 200 空流', async () => {
+  const web = fakeWeb({ failWith: new RateLimitError('账号限流', { retryAfterMs: 30_000 }) });
+  await withServer({ web }, async (base) => {
+    const res = await fetch(`${base}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(chatBody({ stream: true })),
+    });
+    assert.equal(res.status, 429);
+    assert.equal(res.headers.get('retry-after'), '30');
+    assert.match(res.headers.get('content-type') || '', /json/);
+    const json = await res.json();
+    assert.equal(json.error?.code, 'deepseek_rate_limited');
+  });
+});
+
+test('流式：首字节前未知错误 → 500 JSON，而不是 200 空流', async () => {
+  const web = fakeWeb({ failWith: new Error('boom') });
+  await withServer({ web }, async (base) => {
+    const res = await fetch(`${base}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(chatBody({ stream: true })),
+    });
+    assert.equal(res.status, 500);
+    const json = await res.json();
+    assert.match(json.error?.message || '', /boom/);
+  });
+});
+
+// ------------------------------------------------ 复用路径：增量无法拆分时退回全量重建
+
+test('复用会话：增量是一整条超大消息（无段落可拆）→ 退回全量新会话并转附件，不 413', async () => {
+  const web = fakeWeb({ sessionIds: true, texts: ['OK-FAKE-1', 'OK-FAKE-2'] });
+  await withServer(
+    { web, env: { MAX_PROMPT_CHARS: '5000', MAX_ATTACHMENT_CHARS: '2000000' } },
+    async (base) => {
+      const cid = `reuse-long-${Date.now()}`;
+      const first = await fetch(`${base}/v1/chat/completions`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'x-conversation-id': cid },
+        body: JSON.stringify({ model: 'deepseek-flash', messages: [{ role: 'system', content: 'S' }, { role: 'user', content: 'U1' }] }),
+      });
+      assert.equal(first.status, 200);
+      const huge = `H-${'x'.repeat(120_000)}`;
+      const second = await fetch(`${base}/v1/chat/completions`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'x-conversation-id': cid },
+        body: JSON.stringify({
+          model: 'deepseek-flash',
+          messages: [
+            { role: 'system', content: 'S' },
+            { role: 'user', content: 'U1' },
+            { role: 'assistant', content: 'OK-FAKE-1' },
+            { role: 'user', content: huge },
+          ],
+        }),
+      });
+      assert.equal(second.status, 200);
+      assert.equal(web.calls, 2);
+      assert.ok(web.uploads.length >= 1, '全量重建时应把超长上下文转成附件');
+      assert.ok(web.lastPrompt.length <= 5000, `全量 prompt 仍超限: ${web.lastPrompt.length}`);
+    },
+  );
 });
