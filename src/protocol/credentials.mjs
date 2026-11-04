@@ -73,6 +73,20 @@ export function credentialSummary(creds) {
   };
 }
 
+/**
+ * 判断采集到的凭据是否真的属于登录态。
+ *
+ * 隔离 profile（没有登录）打开 chat.deepseek.com 时，前端会自动领一个匿名 guest
+ * userToken，看起来和真实 token 一样，但不具备账号能力。实测证据（D 项）：
+ * guest 凭据 cookie 只有 HWWAFSESID/HWWAFSESTIME/ds_session_id/smidV2，
+ * 没有 hif 缓存（hasHifLeim/hasHifDliq 均为 false），用它发消息返回
+ * Authorization Failed (invalid token)。注意 smidV2 匿名访客也会下发，不能当登录标记。
+ * 真实登录态采集到的记录里 hif_leim / hif_dliq 均有值。
+ */
+export function hasLoginMarker(creds) {
+  return Boolean(creds?.hifLeim) || Boolean(creds?.hifDliq);
+}
+
 export function loadCredentials(file) {
   try {
     const creds = JSON.parse(fs.readFileSync(file, 'utf8'));
@@ -148,6 +162,10 @@ export async function harvestCredentials({ config, logger, waitMs = config.proto
       harvestMs: Date.now() - startedAt,
     };
     record.cookieHeader = cookieHeaderFrom(record.cookies);
+    if (!record.userToken) throw new Error('profile 里没有 userToken');
+    if (!hasLoginMarker(record)) {
+      throw new Error('profile 里只有匿名 guest token（缺 hif 缓存），不是登录态，拒绝缓存');
+    }
     logger?.info?.('协议凭据已采集', credentialSummary(record));
     return record;
   } finally {

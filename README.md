@@ -464,7 +464,7 @@ ENGINE=protocol npm start     # 首次请求会打开浏览器几秒「取凭据
 
 | 路径 | 耗时（单条「你好」） | 内存 | 依赖浏览器 | 风控暴露面 |
 | --- | --- | --- | --- | --- |
-| **protocol**（Node HTTPS） | **warm 1.97s / cold 12.0s** | Node RSS 73–80MB；浏览器 0 进程 | 仅取/刷凭据时短暂启动 | HTTP 语义层与浏览器一致（cookie/hif/UA/CH/Referer）；TLS/HTTP2 由 Node 发出，与 Edge 不同（是否被识别**未验证**） |
+| **protocol**（Node HTTPS） | **warm 1.97s / cold 12.0s** | Node RSS 73–80MB；浏览器 0 进程 | 仅取/刷凭据时短暂启动 | HTTP 语义层与浏览器一致（cookie/hif/UA/CH/Referer）；TLS 均为 TLS1.3 + ALPN h2 + `TLS_AES_256_GCM_SHA384`，但 JA3 不同（Node `d67b…` / Edge `21d9…`），30 分钟探测内未见 TLS 层拒绝 |
 | light（页面 fetch） | 2–4s（历史值，**本轮未复测**） | 浏览器级（未单独测） | 全程 | 浏览器网络栈，TLS/JA3/HTTP2/头顺序与浏览器一致 |
 | hybrid（真实交互） | 6.05–8.72s（输入 84–130ms，首字 1.73s） | 活跃 13 进程 879–944MB，空闲 0 | 全程 | 真实键鼠事件 + 真实页面，暴露面最小 |
 
@@ -475,19 +475,21 @@ ENGINE=protocol npm start     # 首次请求会打开浏览器几秒「取凭据
 
 ### 凭据有效期与刷新机制
 
-| 材料 | 来源 | 能静态复用吗 | 有效期 / 刷新 |
+| 材料 | 来源 | 能静态复用吗 | 有效期 / 刷新（实测） |
 | --- | --- | --- | --- |
-| `smidV2` | profile cookie | 是 | 服务端下发过期时间；具体时长**未验证** |
-| `HWWAFSESTIME` / `HWWAFSESID` | profile cookie（httpOnly） | 是 | WAF 会话；过期需浏览器重新走一次页面，**时长未验证** |
-| `ds_session_id` | profile cookie（httpOnly） | 是 | 登录会话；失效表现为 401/403 → 触发刷新 |
-| `userToken` | profile localStorage | 是（解包 `{value}` / 字符串） | 登录态；warm 12s 后仍有效，长期时长**未验证** |
+| `smidV2` | profile cookie | 是 | `expires` 2027-11-16T10:00:30Z（约 377 天）；匿名访客也会下发，不能当登录标记 |
+| `HWWAFSESTIME` / `HWWAFSESID` | profile cookie（httpOnly） | 是 | HttpOnly+Secure，**会话 cookie**（`expires=-1`）；30 分钟内 13 个 API 响应 `set-cookie` 均为空，聊天请求不刷新 |
+| `ds_session_id` | profile cookie（httpOnly） | 是 | HttpOnly+Secure+Strict，会话 cookie；失效表现为 401/403 → 触发刷新 |
+| `userToken` | profile localStorage | 是（解包 `{value}` / 字符串） | age 1 / 10 / 30 分钟各发一条「你好」均 HTTP 200；更长时长未测 |
 | `deepseek-device-id:chat` | profile localStorage | 是 | 长期稳定；换 ID 会触发 `check_device` |
-| `hif_leim_cached` / `hif_dliq_cached` | profile localStorage | 是（页面缓存的字符串） | TTL **未验证**；复用旧签名会不会被拒也**未验证** |
-| PoW | 本地 Go 求解器，按 challenge 现算 | — | 每次请求新 challenge；`expire_at` 有安全余量 |
+| `hif_leim_cached` / `hif_dliq_cached` | profile localStorage | 是（页面缓存的字符串） | SDK 按响应头 `x-hif-ttl`（默认 600s）定时自刷新；300s 被动观察 0 次变化；旧值 age 1/10/30 分钟均被接受 |
+| PoW | 本地 Go 求解器，按 challenge 现算 | 不必复用 | 每次请求新 challenge；`expire_at` 有安全余量 |
 
 刷新机制：`PROTOCOL_REFRESH_ON_AUTH_FAIL=true` 时，遇到凭据类错误会关闭旧凭据、重新打开
 profile 采集一次并覆盖落盘，再重试**一次**；仍失败且 `PROTOCOL_FALLBACK_HYBRID=true` 才升级 hybrid。
-**本轮没有刻意构造 401/403 实验**（避免探测封号边界），刷新与降级链路只有单测覆盖，真实触发标为**未验证**。
+已用**假凭据 + 隔离 profile**真实触发验证：`INVALID_TOKEN` → 刷新一次 → 重试 → 仍失败升级 hybrid；
+`/healthz` 的 `layer` / `degradations` / `lastReason` / `credentialSource` 均按预期变化。
+采集结果必须带 hif 缓存（登录态标记）才会落盘；匿名 guest token 会被拒绝，坏凭据不会覆盖缓存。
 
 ---
 

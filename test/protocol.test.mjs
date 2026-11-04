@@ -5,9 +5,10 @@ import {
   buildProtocolExtras,
   cookieHeaderFrom,
   credentialSummary,
+  hasLoginMarker,
   unwrapStorageValue,
 } from '../src/protocol/credentials.mjs';
-import { ProtocolEngine } from '../src/protocol/client.mjs';
+import { ProtocolEngine, looksLikeCredentialFailure } from '../src/protocol/client.mjs';
 
 test('unwrapStorageValue：json 字符串 / {value} / 裸值', () => {
   assert.equal(unwrapStorageValue('"abc"'), 'abc');
@@ -55,6 +56,36 @@ test('buildProtocolExtras：只用实测字段，不伪造额外头', () => {
   // 没有证据的头不出现
   assert.equal(extras['x-requested-with'], undefined);
   assert.equal(extras['sec-ch-ua-full-version-list'], undefined);
+});
+
+test('looksLikeCredentialFailure：覆盖实测的 INVALID_TOKEN / session_failed', () => {
+  const mk = (message, code, status) => Object.assign(new Error(message), { code, status });
+  assert.equal(looksLikeCredentialFailure(mk('创建会话失败：INVALID_TOKEN', 'session_failed', 502)), true);
+  assert.equal(looksLikeCredentialFailure(mk('Authorization Failed (invalid token)', null, 200)), true);
+  assert.equal(looksLikeCredentialFailure(mk('invalid_token', null, 200)), true);
+  assert.equal(looksLikeCredentialFailure(mk('网络错误', 'network', 502)), false);
+  assert.equal(looksLikeCredentialFailure(null), false);
+});
+
+test('hasLoginMarker：拒绝匿名 guest，只认 hif 缓存', () => {
+  // 实测 guest：匿名 token + 5 个 cookie（含 smidV2），但无 hif 缓存
+  assert.equal(
+    hasLoginMarker({
+      userToken: 'guest-token',
+      cookies: [
+        { name: 'HWWAFSESID' },
+        { name: 'HWWAFSESTIME' },
+        { name: 'ds_session_id' },
+        { name: 'smidV2' },
+        { name: '.thumbcache_6b2e' },
+      ],
+    }),
+    false,
+  );
+  assert.equal(hasLoginMarker({ userToken: 't', cookies: [], hifLeim: 'x' }), true);
+  assert.equal(hasLoginMarker({ userToken: 't', cookies: [], hifDliq: 'x' }), true);
+  assert.equal(hasLoginMarker({}), false);
+  assert.equal(hasLoginMarker(null), false);
 });
 
 test('ProtocolEngine：认证失败且关闭刷新/降级时不吞错', async () => {

@@ -22,9 +22,11 @@ import {
  * 区别只是额外注入 cookie、x-hif 头、浏览器真实 UA / Client Hints。
  */
 
-const AUTH_HINTS = [/authorization failed/i, /invalid token/i, /token.*expired/i, /40003/];
+// 实测补充分支：假 token 调 /chat_session/create 返回 HTTP 502 + code=session_failed +
+// message=INVALID_TOKEN（下划线形式，旧正则 /invalid token/ 匹配不到）。
+const AUTH_HINTS = [/authorization failed/i, /invalid[_ ]token/i, /token.*expired/i, /40003/, /INVALID_TOKEN/];
 
-function looksLikeCredentialFailure(err) {
+export function looksLikeCredentialFailure(err) {
   if (!err) return false;
   if (err.name === 'AuthExpiredError') return true;
   if (err.status === 401 || err.status === 403) return true;
