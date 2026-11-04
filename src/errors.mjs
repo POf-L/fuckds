@@ -31,7 +31,9 @@ export class AuthExpiredError extends UpstreamError {
   constructor(
     message = 'DeepSeek 登录态无效或已过期，请重新执行 `npm run auth -- <userToken>` 写入 token',
   ) {
-    super(message, { status: 503, code: 'deepseek_auth_required' });
+    // 凭据失效必须是 401：客户端要能据此重新登录，而不是当成上游 5xx 无脑重试。
+    // code 保持 deepseek_auth_required，方便日志/监控按 code 聚合。
+    super(message, { status: 401, code: 'deepseek_auth_required' });
     this.name = 'AuthExpiredError';
   }
 }

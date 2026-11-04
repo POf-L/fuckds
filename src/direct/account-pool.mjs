@@ -2,6 +2,11 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 
+/** 账号指纹：会话归属、日志、/healthz 都用它，绝不输出 token 原值 */
+export function fingerprintOf(token) {
+  return crypto.createHash('sha256').update(String(token || '')).digest('hex').slice(0, 16);
+}
+
 /**
  * 账号池。
  *
@@ -18,7 +23,7 @@ export class AccountPool {
       index,
       token,
       // 会话属于某个账号：复用会话时按这个指纹把请求钉回原号（不落盘原文）
-      fingerprint: crypto.createHash('sha256').update(token).digest('hex').slice(0, 16),
+      fingerprint: fingerprintOf(token),
       // 协议通道会注入浏览器 profile 里真实的 deepseek-device-id:chat；
       // 没有注入时沿用按 token 派生的稳定设备 ID。
       deviceId: deviceIds[token] || loadDeviceId(dataDir, token),
@@ -40,18 +45,39 @@ export class AccountPool {
     return this.accounts.length;
   }
 
-  /** 轮询取一个不在冷却的账号；全都在冷却就返回 null */
-  pick(now = Date.now()) {
+  /**
+   * 取一个不在冷却的账号；全都在冷却就返回 null。
+   * 传入 loadOf 时按「负载最低」优先，并列时按轮询顺序（不同账号才能真正并行）。
+   */
+  pick(now = Date.now(), loadOf = null) {
+    const chosen = this.peek(now, loadOf);
+    if (!chosen) return null;
+    this.cursor = (chosen.index + 1) % this.accounts.length;
+    chosen.lastUsedAt = now;
+    chosen.requests += 1;
+    return chosen;
+  }
+
+  /** 只看不占：预测「下一个会被选中的账号」（会话命名空间/日志用，不消耗轮询游标） */
+  peek(now = Date.now(), loadOf = null) {
+    const ordered = [];
     for (let i = 0; i < this.accounts.length; i += 1) {
-      const account = this.accounts[(this.cursor + i) % this.accounts.length];
-      if (account.cooldownUntil <= now) {
-        this.cursor = (account.index + 1) % this.accounts.length;
-        account.lastUsedAt = now;
-        account.requests += 1;
-        return account;
+      ordered.push(this.accounts[(this.cursor + i) % this.accounts.length]);
+    }
+    const available = ordered.filter((account) => account.cooldownUntil <= now);
+    if (!available.length) return null;
+    let chosen = available[0];
+    if (loadOf) {
+      let best = loadOf(chosen);
+      for (const account of available.slice(1)) {
+        const load = loadOf(account);
+        if (load < best) {
+          best = load;
+          chosen = account;
+        }
       }
     }
-    return null;
+    return chosen;
   }
 
   /** 最近的可用时间 */

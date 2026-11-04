@@ -295,7 +295,7 @@ test('上游失败时返回 OpenAI 风格错误', async () => {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(chatBody()),
     });
-    assert.equal(res.status, 503);
+    assert.equal(res.status, 401);
     const json = await res.json();
     assert.equal(json.error.code, 'deepseek_auth_required');
   });

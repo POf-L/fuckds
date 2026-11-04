@@ -12,7 +12,7 @@ import { planOverflow } from './prompt/overflow.mjs';
 import { assertNoProtocolTags } from './prompt/sanitize.mjs';
 import { parseTextToolCalls, scanTextToolCallBlocks } from './prompt/text-protocol.mjs';
 import { parseToolCalls } from './prompt/tools.mjs';
-import { hashId } from './session/store.mjs';
+import { conversationKey, hashId } from './session/store.mjs';
 
 /**
  * 引擎调用的公共部分：拼 prompt → 图片/超长附件上传 → 调 web.chat → 解析工具调用。
@@ -21,6 +21,54 @@ import { hashId } from './session/store.mjs';
  * 保证两条链路在「防自造结果」「超长转附件」上的行为完全一致。
  */
 export function createChatRunner({ config, log, web, sessions = null }) {
+  /*
+   * 同一会话键串行，不同会话键并行。
+   *
+   * 为什么必须在锁内重新 plan：两个并发请求如果都在锁外 plan，会读到同一个
+   * lastMessageId，于是两条都带同样的 parent_message_id 提交，网页会话分叉，
+   * 之后的历史校验永远对不上。锁覆盖「plan → 上传 → web.chat → commit」整段，
+   * 第二条请求进来时看到的一定是第一条提交后的链。
+   */
+  const lockSlots = new Map();
+
+  async function withSessionLock(key, fn) {
+    let slot = lockSlots.get(key);
+    if (!slot) {
+      slot = { tail: Promise.resolve(), waiting: 0 };
+      lockSlots.set(key, slot);
+    }
+    const waitFor = slot.tail;
+    slot.waiting += 1;
+    let release;
+    const gate = new Promise((resolve) => {
+      release = resolve;
+    });
+    slot.tail = waitFor.then(() => gate, () => gate);
+    if (slot.waiting > 1) {
+      log?.info?.('同一会话已有请求在跑，本次排队等待', { keyHash: hashId(key), waiting: slot.waiting });
+    }
+    await waitFor.catch(() => {});
+    try {
+      return await fn();
+    } finally {
+      slot.waiting -= 1;
+      release();
+      if (slot.waiting === 0) lockSlots.delete(key);
+    }
+  }
+
+  /** 会话键：能算出来就串行化；没有会话复用 / 算不出键时保持原有并发 */
+  const sessionLockKey = (request) => {
+    if (config.runtime.sessionReuse === false || !sessions) return null;
+    return conversationKey(request.messages, request.conversationId)?.key || null;
+  };
+
+  return async function runChat(request, hooks = {}) {
+    const key = sessionLockKey(request);
+    if (!key) return runChatCore(request, hooks);
+    return withSessionLock(key, () => runChatCore(request, hooks));
+  };
+
   /**
    * @param {object} request 归一化后的内部请求（messages 为 OpenAI 语义）
    * @param {object} [hooks]
@@ -30,7 +78,7 @@ export function createChatRunner({ config, log, web, sessions = null }) {
    * @param {(text: string) => void} [hooks.onContent] 流式正文增量（已过滤协议行）
    * @param {(text: string) => void} [hooks.onReasoning] 流式思考增量
    */
-  return async function runChat(request, { signal, meta = {}, onPrompt, onContent, onReasoning } = {}) {
+  async function runChatCore(request, { signal, meta = {}, onPrompt, onContent, onReasoning } = {}) {
     const { maxPromptChars, maxAttachmentChars, overflowToAttachment } = config.runtime;
 
     /**
@@ -68,9 +116,27 @@ export function createChatRunner({ config, log, web, sessions = null }) {
     let sessionPlan = { key: null, reason: 'disabled', hashes: [], entry: null };
     let sessionArgs = null;
     let sessionMode = 'new';
+    /** 本次请求应该在哪个账号上跑（新对话由引擎按负载选，然后钉住） */
+    let accountHint = null;
 
     if (sessionAllowed && layer !== 'hybrid') {
-      sessionPlan = sessions.plan(request.messages, { conversationId: request.conversationId });
+      /*
+       * 网页会话按账号命名空间隔离：不同账号下同名映射键不能互相串。
+       * 已有条目沿用它自己的作用域（账号粘性）；新对话先问引擎「这次会落到哪个账号」，
+       * 再用该账号的哈希前缀作为作用域建键。planAccount 只读，不发请求。
+       */
+      const existing = sessions.lookup(request.messages, { conversationId: request.conversationId });
+      let scope = existing?.scope || null;
+      if (scope) {
+        accountHint = existing?.entry?.accountFingerprint || null;
+      } else {
+        const planned = typeof web.planAccount === 'function'
+          ? web.planAccount(existing?.entry?.accountFingerprint || null)
+          : null;
+        accountHint = planned?.fingerprint || null;
+        scope = accountHint ? hashId(accountHint) : null;
+      }
+      sessionPlan = sessions.plan(request.messages, { conversationId: request.conversationId, scope });
       if (sessionPlan.reuse) {
         const delta = buildDeltaPrompt({
           messages: request.messages,
@@ -302,7 +368,11 @@ export function createChatRunner({ config, log, web, sessions = null }) {
         refFileIds: ids,
         signal,
         meta,
-        session: sessionArgs ? { ...sessionArgs, rebuild: rebuildSession } : null,
+        session: sessionArgs
+          ? { ...sessionArgs, rebuild: rebuildSession }
+          : accountHint
+            ? { accountFingerprint: accountHint }
+            : null,
         onDelta: hooks.onDelta,
         onThinking: hooks.onThinking,
       });
@@ -412,5 +482,5 @@ export function createChatRunner({ config, log, web, sessions = null }) {
       elapsedMs: result.elapsedMs,
       ...reply,
     };
-  };
+  }
 }

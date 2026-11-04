@@ -124,6 +124,8 @@ export function loadConfig(env = process.env) {
         ROOT,
         expandHome(str(env.PROTOCOL_CREDENTIALS_FILE, path.join(dataDir, 'protocol-credentials.json'))),
       ),
+      // 多账号：目录下每个 *.json 是一份凭据（= 一个账号，一个独立 DirectEngine）
+      accountsDir: path.resolve(ROOT, expandHome(str(env.PROTOCOL_ACCOUNTS_DIR, path.join(dataDir, 'protocol-accounts')))),
       // 请求失败且证据指向凭据失效时，从 profile 刷新一次凭据再重试
       refreshOnAuthFail: bool(env.PROTOCOL_REFRESH_ON_AUTH_FAIL, true),
       // 刷新后仍失败，是否降级到 hybrid 全浏览器
@@ -246,6 +248,10 @@ export function loadConfig(env = process.env) {
       // 账号被限流后的冷却时间，以及请求最多愿意等多久
       accountCooldownMs: int(env.ACCOUNT_COOLDOWN_MS, 60_000),
       maxCooldownWaitMs: int(env.MAX_COOLDOWN_WAIT_MS, 5_000),
+      // 单账号最小请求间隔（毫秒）：在「单账号串行」之外再加一层节奏限制。
+      // 默认 3000：浏览器引擎的 SEND_INTERVAL_MS 保守值是 4000（网页会提示“发送过于频繁”），
+      // 协议通道没有 UI 输入耗时，取 0.75 倍保守值留出余量；设 0 可关闭。
+      accountMinGapMs: int(env.ACCOUNT_MIN_GAP_MS, 3_000),
       // 首段正文最多等多久思考内容（毫秒），保证 reasoning 一定排在 content 前面
       reasoningHoldMs: int(env.REASONING_HOLD_MS, 900),
       rateLimitBackoffMs: int(env.RATE_LIMIT_BACKOFF_MS, 4000),

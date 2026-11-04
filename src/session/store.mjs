@@ -154,27 +154,64 @@ export class WebSessionStore {
   }
 
   /**
+   * 找到这段对话已经落盘的映射（不判断能否复用）。
+   *
+   * 键有两种形态：无账号作用域时就是 `cid:` / `auto:`；有账号作用域时是
+   * `<scope>|cid:`。账号作用域 = 账号指纹的哈希前缀，用来保证「不同账号下同名
+   * 映射键不会互相串」。传入 scope 时优先返回该命名空间里的条目。
+   */
+  lookup(messages, { conversationId, scope = null } = {}) {
+    const conv = conversationKey(messages, conversationId);
+    if (!conv) return null;
+    const suffix = `|${conv.key}`;
+    const scopedKey = scope ? `${scope}|${conv.key}` : null;
+    let unscoped = null;
+    let otherScope = null;
+    for (const [key, entry] of this.entries) {
+      // 指定了账号作用域：先认自己命名空间里的那条
+      if (scopedKey && key === scopedKey) {
+        return { ...conv, convKey: conv.key, key, scope, entry };
+      }
+      if (key === conv.key) {
+        if (!unscoped) unscoped = { ...conv, convKey: conv.key, key, scope: null, entry };
+        continue;
+      }
+      if (key.endsWith(suffix) && !otherScope) {
+        otherScope = { ...conv, convKey: conv.key, key, scope: key.slice(0, -suffix.length), entry };
+      }
+    }
+    // 兼容旧的无作用域条目；没指定 scope 时才接受「别的账号命名空间」里的条目
+    // （那一条只用于发现对话已绑定的账号）；指定了 scope 就必须严格隔离。
+    return unscoped || (scope ? null : otherScope) || { ...conv, convKey: conv.key, key: null, scope: null, entry: null };
+  }
+
+  /**
    * 判断本次请求能否复用已有网页会话。
    * @param {object[]} messages 归一化后的完整客户端历史（每轮都会全量带上）
-   * @param {{conversationId?: string}} [options]
+   * @param {{conversationId?: string, scope?: string}} [options]
+   *   scope：账号作用域哈希前缀；提供时新会话的键会写成 `<scope>|cid:...`
    * @returns {{
    *   key: string|null, source: 'client'|'prefix'|null, prefixHash: string|null,
    *   reuse: boolean, deltaFrom: number, entry: object|null, reason: string,
    *   hashes: string[],
    * }}
    */
-  plan(messages, { conversationId } = {}) {
+  plan(messages, { conversationId, scope = null } = {}) {
     const hashes = (messages || []).map(messageHash);
-    const conv = conversationKey(messages, conversationId);
-    if (!conv) {
+    const found = this.lookup(messages, { conversationId, scope });
+    if (!found) {
       return { key: null, source: null, prefixHash: null, reuse: false, deltaFrom: 0, entry: null, reason: 'no-key', hashes };
     }
-    const entry = this.entries.get(conv.key);
+    const { key: foundKey, entry: foundEntry } = found;
+    // 已经落盘的对话沿用它原来的命名空间；新对话才按本次选中的账号生成键
+    const key = foundKey || (scope ? `${scope}|${found.convKey}` : found.convKey);
+    const conv = { key, source: found.source, prefixHash: found.prefixHash, scope: found.scope };
+    const entry = foundEntry;
     if (!entry) {
       return { ...conv, reuse: false, deltaFrom: 0, entry: null, reason: 'new-conversation', hashes };
     }
     if (Date.now() - (entry.updatedAt || 0) > this.ttlMs) {
-      this.entries.delete(conv.key);
+      this.entries.delete(key);
       return { ...conv, reuse: false, deltaFrom: 0, entry: null, reason: 'expired', hashes };
     }
     const stored = entry.sentHashes;

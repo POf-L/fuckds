@@ -96,7 +96,10 @@ test('ProtocolEngine：认证失败且关闭刷新/降级时不吞错', async ()
   const engine = new ProtocolEngine({ config, logger: { child: () => ({ warn() {}, info() {}, debug() {} }) } });
   const err = Object.assign(new Error('Authorization Failed (40003)'), { status: 401, name: 'ApiError' });
   engine.inner = { chat: async () => { throw err; }, close: () => {} };
-  await assert.rejects(engine.chat({ prompt: '你好' }), (e) => e === err);
+  await assert.rejects(
+    engine.chat({ prompt: '你好' }),
+    (e) => e.name === 'AuthExpiredError' && e.status === 401 && /协议凭据失效/.test(e.message),
+  );
   assert.equal(engine.layer, 'protocol');
   assert.equal(engine.degradations, 0);
 });

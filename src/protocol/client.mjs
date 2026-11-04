@@ -1,4 +1,9 @@
+import fs from 'node:fs';
+import path from 'node:path';
+
 import { DirectEngine } from '../direct/client.mjs';
+import { AuthExpiredError } from '../errors.mjs';
+import { fingerprintOf } from '../direct/account-pool.mjs';
 import { HybridEngine } from '../hybrid/client.mjs';
 import {
   buildProtocolExtras,
@@ -11,15 +16,18 @@ import {
 /**
  * 协议优先通道（ENGINE=protocol）：
  *
- *   1. 默认：用 data/protocol-credentials.json 里的凭据（cookie + token + hif 缓存）
- *      直接发 Node HTTPS，不启动浏览器。
+ *   1. 默认：用 data/protocol-accounts/*.json 里的凭据（cookie + token + hif 缓存）
+ *      直接发 Node HTTPS，不启动浏览器。每个凭据文件 = 一个账号 = 一个 DirectEngine
+ *      （因此每个账号天然拥有独立的 PoW / 设备 ID / 单账号串行队列）。
  *   2. 凭据缺失：打开 hybrid profile 采集一次（浏览器只活几秒），落盘后关闭。
  *   3. 请求失败且证据指向凭据失效（401/403/“invalid token”/40003）：
  *      从 profile 刷新一次凭据并重试。
  *   4. 仍失败：降级到 hybrid 全浏览器，并把层级/次数写进 status()（/healthz 可见）。
  *
- * 所有请求构造复用 DirectEngine（同样的 PoW、会话、SSE 解析），
- * 区别只是额外注入 cookie、x-hif 头、浏览器真实 UA / Client Hints。
+ * 账号调度：
+ *   - 一个对话第一次落账号后固定（会话条目里存 accountFingerprint），后续请求钉回原号；
+ *   - 新对话选「可用且负载最低」的账号；全都冷却时选冷却结束最早的；
+ *   - 单账号串行 + 最小间隔由 DirectEngine 的 AccountScheduler 保证（不同账号并行）。
  */
 
 // 实测补充分支：假 token 调 /chat_session/create 返回 HTTP 502 + code=session_failed +
@@ -39,9 +47,12 @@ export class ProtocolEngine {
     this.config = config;
     this.log = logger;
     this.credentialsFile = config.protocol.credentialsFile;
+    this.accountsDir = config.protocol.accountsDir
+      || path.join(config.dataDir || '.', 'protocol-accounts');
+    /** [{ creds, file, fingerprint, engine }] */
+    this.accounts = [];
     this.inner = null;
     this.hybrid = null;
-    this.creds = null;
     this.credentialSource = 'none';
     this.layer = 'protocol';
     this.degradations = 0;
@@ -51,7 +62,7 @@ export class ProtocolEngine {
   }
 
   async ensureStarted() {
-    if (this.inner) return;
+    if (this.accounts.length || this.inner) return;
     await this.#loadOrHarvest(false);
   }
 
@@ -61,6 +72,19 @@ export class ProtocolEngine {
   }
 
   status() {
+    const perAccount = this.accounts.map((account) => {
+      const snapshot = account.engine.status?.() ?? {};
+      const scheduled = snapshot.scheduler?.[0] ?? {};
+      return {
+        accountHash: account.fingerprint.slice(0, 12),
+        available: scheduled.available !== false,
+        inflight: scheduled.inflight ?? 0,
+        queued: scheduled.queued ?? 0,
+        cooldownMs: scheduled.cooldownMs ?? 0,
+        lastStartAt: scheduled.lastStartAt ?? null,
+        credentials: credentialSummary(account.creds),
+      };
+    });
     return {
       engine: 'protocol',
       layer: this.layer,
@@ -69,7 +93,10 @@ export class ProtocolEngine {
       credentialSource: this.credentialSource,
       lastRefreshAt: this.lastRefreshAt,
       lastHarvestMs: this.lastHarvestMs,
-      credentials: this.creds ? credentialSummary(this.creds) : null,
+      // 多账号：每个账号独立的 in-flight / 队列长度 / 冷却（只给哈希前缀）
+      accounts: perAccount,
+      accountsTotal: perAccount.length,
+      credentials: this.accounts[0] ? credentialSummary(this.accounts[0].creds) : null,
       // 网页会话复用状态：只暴露布尔与哈希前缀，绝不输出原始会话 id
       ...(this.inner?.sessionStatus?.() ?? {}),
       browser: this.layer === 'hybrid',
@@ -81,42 +108,115 @@ export class ProtocolEngine {
     return this.status();
   }
 
+  /**
+   * 预测这次请求会落在哪个账号（只读，不发请求）。
+   * 已绑定的对话钉回原账号；新对话按「可用 + 负载最低 → 冷却结束最早」选择。
+   */
+  planAccount(preferredFingerprint = null) {
+    const selected = this.#selectAccount(preferredFingerprint);
+    if (!selected) return null;
+    const described = selected.engine.describeAccount?.() ?? {};
+    return { ...described, fingerprint: selected.fingerprint };
+  }
+
   async close() {
-    await this.inner?.close?.().catch?.(() => {});
+    for (const account of this.accounts) {
+      await account.engine?.close?.().catch?.(() => {});
+    }
     await this.hybrid?.close?.().catch?.(() => {});
+    this.accounts = [];
     this.inner = null;
     this.hybrid = null;
   }
 
   /* ------------------------------------------------------------------ */
 
-  async #loadOrHarvest(force) {
-    let creds = force ? null : loadCredentials(this.credentialsFile);
-    if (creds) {
-      this.credentialSource = 'cache';
-    } else {
-      creds = await harvestCredentials({ config: this.config, logger: this.log });
-      this.credentialSource = 'harvested';
-      this.lastHarvestMs = creds.harvestMs ?? null;
-      saveCredentials(this.credentialsFile, creds);
+  /** 读 accountsDir 下所有凭据；兼容旧的单文件配置；按 token 指纹去重 */
+  #loadAllCredentials() {
+    const found = [];
+    try {
+      for (const name of fs.readdirSync(this.accountsDir)) {
+        if (!name.endsWith('.json')) continue;
+        const creds = loadCredentials(path.join(this.accountsDir, name));
+        if (creds) found.push({ creds, file: path.join(this.accountsDir, name) });
+      }
+    } catch {
+      /* 目录不存在：继续看旧的单文件 */
     }
-    this.creds = creds;
-    this.#buildInner(creds);
+    const legacy = loadCredentials(this.credentialsFile);
+    if (legacy) found.push({ creds: legacy, file: this.credentialsFile });
+    const seen = new Set();
+    return found.filter(({ creds }) => {
+      const fingerprint = fingerprintOf(creds.userToken);
+      if (seen.has(fingerprint)) return false;
+      seen.add(fingerprint);
+      return true;
+    });
   }
 
-  #buildInner(creds) {
-    const extras = buildProtocolExtras(creds);
-    const deepseek = {
-      ...this.config.deepseek,
-      token: creds.userToken,
-      tokens: [creds.userToken],
-      deviceIds: { [creds.userToken]: creds.deviceId },
-      protocolExtras: extras,
-    };
-    this.inner = new DirectEngine({
-      config: { ...this.config, deepseek },
-      logger: this.log.child('protocol-direct'),
+  #saveCredential(creds) {
+    fs.mkdirSync(this.accountsDir, { recursive: true });
+    const file = path.join(this.accountsDir, `account-${fingerprintOf(creds.userToken)}.json`);
+    saveCredentials(file, creds);
+    return file;
+  }
+
+  async #loadOrHarvest(force) {
+    let loaded = force ? [] : this.#loadAllCredentials();
+    if (loaded.length) {
+      this.credentialSource = loaded.length > 1 ? `cache:${loaded.length}-accounts` : 'cache';
+    } else {
+      const creds = await harvestCredentials({ config: this.config, logger: this.log });
+      const file = this.#saveCredential(creds);
+      this.credentialSource = 'harvested';
+      this.lastHarvestMs = creds.harvestMs ?? null;
+      loaded = [{ creds, file }];
+    }
+    this.#buildEngines(loaded);
+  }
+
+  #buildEngines(loaded) {
+    this.accounts = loaded.map(({ creds, file }) => {
+      const fingerprint = fingerprintOf(creds.userToken);
+      const deepseek = {
+        ...this.config.deepseek,
+        token: creds.userToken,
+        tokens: [creds.userToken],
+        deviceIds: { [creds.userToken]: creds.deviceId },
+        protocolExtras: buildProtocolExtras(creds),
+      };
+      const engine = new DirectEngine({
+        config: { ...this.config, deepseek },
+        logger: this.log.child('protocol-direct'),
+      });
+      return { creds, file, fingerprint, engine };
     });
+    this.inner = this.accounts[0]?.engine ?? null;
+    this.log.info?.(`协议通道已加载 ${this.accounts.length} 个账号`, {
+      accounts: this.accounts.map((account) => account.fingerprint.slice(0, 12)),
+    });
+  }
+
+  /**
+   * 选一个账号：绑定的优先（即使冷却也钉住，不把对话漂到别的账号）；
+   * 新对话在可用账号里选负载最低的，全冷却则选最早恢复的。
+   */
+  #selectAccount(preferredFingerprint = null) {
+    if (!this.accounts.length) return null;
+    if (preferredFingerprint) {
+      const bound = this.accounts.find((account) => account.fingerprint === preferredFingerprint);
+      if (bound) return bound;
+    }
+    const described = this.accounts.map((account) => ({
+      account,
+      info: account.engine.describeAccount?.() ?? { available: true, cooldownMs: 0, load: 0 },
+    }));
+    const available = described.filter((item) => item.info.available);
+    const pool = available.length ? available : described;
+    return pool.reduce((best, item) => {
+      if (available.length) return item.info.load < best.info.load ? item : best;
+      return item.info.cooldownMs < best.info.cooldownMs ? item : best;
+    }).account;
   }
 
   async #refreshCredentials() {
@@ -124,9 +224,10 @@ export class ProtocolEngine {
       reason: this.lastReason,
       source: this.credentialSource,
     });
-    const old = this.inner;
+    const old = this.accounts.map((account) => account.engine);
+    this.accounts = [];
     this.inner = null;
-    await old?.close?.().catch?.(() => {});
+    for (const engine of old) await engine?.close?.().catch?.(() => {});
     this.lastRefreshAt = Date.now();
     await this.#loadOrHarvest(true);
     this.degradations += 1;
@@ -139,8 +240,17 @@ export class ProtocolEngine {
     for (;;) {
       try {
         await this.ensureStarted();
-        const result = await this.inner.chat(args);
-        return result;
+        const preferred = args.session?.accountFingerprint ?? args.accountFingerprint ?? null;
+        const selected = this.#selectAccount(preferred);
+        const engine = selected?.engine || this.inner;
+        if (!engine) throw new Error('协议通道没有可用账号');
+        // 钉住账号：把本次选中的账号指纹交给引擎，避免它在内部又换号
+        const sessionArgs = args.session
+          ? { ...args.session, accountFingerprint: args.session.accountFingerprint || selected?.fingerprint }
+          : selected
+            ? { accountFingerprint: selected.fingerprint }
+            : null;
+        return await engine.chat({ ...args, session: sessionArgs });
       } catch (err) {
         if (!looksLikeCredentialFailure(err)) throw err;
         this.lastReason = `${err.name || 'Error'}: ${err.message}`;
@@ -155,7 +265,10 @@ export class ProtocolEngine {
             this.log.warn('协议通道：凭据刷新失败', { reason: refreshErr.message });
           }
         }
-        if (this.config.protocol.fallbackToHybrid === false) throw err;
+        if (this.config.protocol.fallbackToHybrid === false) {
+          // 明确告诉客户端「是凭据失效」，不要伪装成上游 5xx
+          throw err.name === 'AuthExpiredError' ? err : new AuthExpiredError(`协议凭据失效：${err.message}`);
+        }
         this.log.warn('协议通道＋刷新凭据均失败，降级到 hybrid 全浏览器', { reason: this.lastReason });
         this.layer = 'hybrid';
         this.degradations += 1;

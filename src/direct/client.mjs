@@ -3,6 +3,7 @@ import crypto from 'node:crypto';
 import { ApiError, AuthExpiredError, PromptTooLongError, RateLimitError, TimeoutError, UpstreamError } from '../errors.mjs';
 import { sleep } from '../util.mjs';
 import { AccountPool } from './account-pool.mjs';
+import { AccountScheduler } from './scheduler.mjs';
 import {
   buildBrowserHeaders,
   buildUploadHeaders,
@@ -91,6 +92,12 @@ export class DirectEngine {
       deviceIds: config.deepseek.deviceIds || {},
     });
     this.pow = new PowSolver({ bin: config.direct.powBin, logger });
+    // 账号级调度：单账号 FIFO + 单飞，不同账号并行；单账号最小请求间隔见 ACCOUNT_MIN_GAP_MS
+    this.scheduler = new AccountScheduler({
+      pool: this.pool,
+      logger,
+      minGapMs: config.runtime.accountMinGapMs,
+    });
     this.fileCache = new Map();
     this.inflight = 0;
     this.closed = false;
@@ -145,15 +152,60 @@ export class DirectEngine {
   }
 
   status() {
+    const scheduled = this.scheduler.stats();
     return {
       engine: 'direct',
       browser: false,
       pages: 0,
       busy: this.inflight,
-      queued: 0,
+      queued: scheduled.reduce((sum, item) => sum + item.queued, 0),
       token: this.tokens.length > 0,
-      accounts: this.pool.status(),
+      // 每个账号的 in-flight / 队列长度 / 冷却状态（只给哈希前缀）
+      accounts: this.pool.status().map((account, index) => ({ ...account, ...(scheduled[index] || {}) })),
+      scheduler: scheduled,
       ...this.sessionStatus(),
+    };
+  }
+
+  /**
+   * 预测这次请求会落在哪个账号（用于网页会话的「按账号命名空间」）。
+   * 只读，不消耗轮询游标，也不发任何请求。
+   */
+  planAccount(preferredFingerprint = null) {
+    const now = Date.now();
+    const preferred = preferredFingerprint
+      ? this.pool.accounts.find((account) => account.fingerprint === preferredFingerprint)
+      : null;
+    if (preferred) {
+      return {
+        fingerprint: preferred.fingerprint,
+        index: preferred.index + 1,
+        sticky: true,
+        available: preferred.cooldownUntil <= now,
+        cooldownMs: Math.max(0, preferred.cooldownUntil - now),
+      };
+    }
+    const picked = this.pool.peek(now, (account) => this.scheduler.load(account));
+    if (!picked) return null;
+    return {
+      fingerprint: picked.fingerprint,
+      index: picked.index + 1,
+      sticky: false,
+      available: true,
+      cooldownMs: 0,
+    };
+  }
+
+  /** 本引擎（单账号）的可用性/负载快照，供上层多账号路由使用（只读） */
+  describeAccount() {
+    const account = this.pool.accounts[0];
+    if (!account) return { available: false, cooldownMs: 0, load: 0, fingerprint: null };
+    const now = Date.now();
+    return {
+      fingerprint: account.fingerprint,
+      available: account.cooldownUntil <= now,
+      cooldownMs: Math.max(0, account.cooldownUntil - now),
+      load: this.scheduler.load(account),
     };
   }
 
@@ -229,9 +281,14 @@ export class DirectEngine {
         }
 
         try {
-          const result = await this.#run({
-            account, prompt, thinking, search, refFileIds, signal, onDelta, onThinking, startedAt, meta, session,
-          });
+          // 账号级 FIFO + 单飞：同一个账号上的上游请求绝不重叠，不同账号并行
+          const result = await this.scheduler.run(
+            account,
+            () => this.#run({
+              account, prompt, thinking, search, refFileIds, signal, onDelta, onThinking, startedAt, meta, session,
+            }),
+            { signal },
+          );
           this.pool.markHealthy(account);
           return result;
         } catch (err) {
@@ -658,12 +715,18 @@ export class DirectEngine {
   }
 
   #uploadAccount() {
-    const account = this.pool.pick() || this.pool.accounts[0];
-    if (!account) throw new AuthExpiredError();
-    return account;
+    const picked = this.pool.pick(Date.now(), (account) => this.scheduler.load(account))
+      || this.pool.accounts[0];
+    if (!picked) throw new AuthExpiredError();
+    return picked;
   }
 
   async #uploadFile(account, file) {
+    // 上传也是打同一个账号的上游：必须进同一队列，不能和补全请求重叠
+    return this.scheduler.run(account, () => this.#uploadFileNow(account, file));
+  }
+
+  async #uploadFileNow(account, file) {
     const { buffer, mime, name } = file;
     const hash = crypto.createHash('sha256').update(buffer).digest('hex');
     const cached = this.fileCache.get(hash);
@@ -730,7 +793,7 @@ export class DirectEngine {
         return preferred;
       }
     }
-    return this.pool.pick(now);
+    return this.pool.pick(now, (account) => this.scheduler.load(account));
   }
 
   async #createSession(account, signal) {

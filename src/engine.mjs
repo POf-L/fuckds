@@ -41,7 +41,14 @@ export function createEngine({ config, logger }) {
 
   const binExists = powBinExists(config.direct.powBin);
   const canDirect = binExists && Boolean(config.deepseek.token);
-  if (engine === 'auto' && binExists && fs.existsSync(config.protocol.credentialsFile)) {
+  const hasAccountFiles = (() => {
+    try {
+      return fs.readdirSync(config.protocol.accountsDir).some((name) => name.endsWith('.json'));
+    } catch {
+      return false;
+    }
+  })();
+  if (engine === 'auto' && binExists && (fs.existsSync(config.protocol.credentialsFile) || hasAccountFiles)) {
     logger.info('auto：发现协议凭据，优先走 protocol（不启动浏览器）');
     return new ProtocolEngine({ config, logger: logger.child('protocol') });
   }
