@@ -37,6 +37,15 @@ test('evaluateCredentialState：匿名访客 token（30 字符）判 anonymous�
   assert.equal(state.reason, 'token-shape');
 });
 
+test('evaluateCredentialState：含 `/` 的标准 base64 真实 token 仍判 valid', () => {
+  // 实测 DeepSeek 的 userToken 是标准 base64，可能含 `/` 与 `+`，不能按 URL-safe 字母表误杀
+  const b64 = `ab/cd+ef${'g'.repeat(56)}`;
+  const state = evaluateCredentialState({ token: b64, hasLoginMarker: true, harvestedAt: Date.now() - 1000 });
+  assert.equal(b64.length, 64);
+  assert.equal(state.credentialState, 'valid');
+  assert.equal(state.hasToken, true);
+});
+
 test('evaluateCredentialState：缺 hif 登录标记判 anonymous', () => {
   const state = evaluateCredentialState({ token: TOKEN64, hasLoginMarker: false });
   assert.equal(state.credentialState, 'anonymous');

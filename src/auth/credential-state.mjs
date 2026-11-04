@@ -15,9 +15,9 @@
 export const TOKEN_MAX_AGE_MS_DEFAULT = 8 * 60 * 60 * 1000;
 export const TOKEN_STALE_AGE_MS_DEFAULT = 6 * 60 * 60 * 1000;
 
-/** 真实登录态的 userToken 是 64 字符的 URL-safe 串；匿名访客实测是 30 字符 */
+/** 真实登录态的 userToken 是 64 字符 base64 串（实测含 `/`，故不能只允许 URL-safe 字母表）；匿名访客实测是 30 字符 */
 export function looksLikeLoginToken(token) {
-  return typeof token === 'string' && /^[A-Za-z0-9_-]{48,128}$/.test(token);
+  return typeof token === 'string' && /^[A-Za-z0-9_+/=-]{48,128}$/.test(token);
 }
 
 export function evaluateCredentialState({
