@@ -104,6 +104,44 @@ test('ProtocolEngine：认证失败且关闭刷新/降级时不吞错', async ()
   assert.equal(engine.degradations, 0);
 });
 
+test('ProtocolEngine：ALLOW_BROWSER_REFRESH 未开启时刷新被策略拒绝且不降级', async () => {
+  const warns = [];
+  const logger = {
+    warn: (...args) => warns.push(args),
+    child: () => ({ warn: (...args) => warns.push(args), info() {}, debug() {} }),
+  };
+  const config = {
+    protocol: {
+      credentialsFile: 'unused.json',
+      refreshOnAuthFail: true,
+      fallbackToHybrid: true,
+      allowBrowserRefresh: false,
+    },
+    deepseek: {},
+  };
+  const engine = new ProtocolEngine({ config, logger });
+  const err = Object.assign(new Error('创建会话失败：INVALID_TOKEN'), { status: 502, name: 'UpstreamError' });
+  engine.inner = { chat: async () => { throw err; }, close: () => {} };
+  await assert.rejects(
+    engine.chat({ prompt: '你好' }),
+    (e) => e.code === 'refresh_blocked_by_policy' && /ALLOW_BROWSER_REFRESH=false/.test(e.message),
+  );
+  assert.equal(engine.layer, 'protocol');
+  assert.equal(engine.degradations, 0);
+  assert.equal(engine.hybrid, null);
+  assert.equal(warns.some(([msg]) => msg === 'refresh_blocked_by_policy'), true);
+});
+
+test('ProtocolEngine：无凭据时启动采集被策略拒绝（不自动开浏览器）', async () => {
+  const logger = { warn() {}, child: () => ({ warn() {}, info() {}, debug() {} }) };
+  const config = { protocol: { credentialsFile: 'unused.json', allowBrowserRefresh: false }, deepseek: {} };
+  const engine = new ProtocolEngine({ config, logger });
+  await assert.rejects(
+    engine.ensureStarted(),
+    (e) => e.code === 'refresh_blocked_by_policy' && /startup-harvest/.test(e.message),
+  );
+});
+
 test('ProtocolEngine：降级后由 hybrid 接管', async () => {
   const config = { protocol: {}, deepseek: {} };
   const engine = new ProtocolEngine({ config, logger: { child: () => ({ warn() {}, info() {}, debug() {} }) } });

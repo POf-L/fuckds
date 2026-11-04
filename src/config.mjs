@@ -127,9 +127,14 @@ export function loadConfig(env = process.env) {
       // 多账号：目录下每个 *.json 是一份凭据（= 一个账号，一个独立 DirectEngine）
       accountsDir: path.resolve(ROOT, expandHome(str(env.PROTOCOL_ACCOUNTS_DIR, path.join(dataDir, 'protocol-accounts')))),
       // 请求失败且证据指向凭据失效时，从 profile 刷新一次凭据再重试
-      refreshOnAuthFail: bool(env.PROTOCOL_REFRESH_ON_AUTH_FAIL, true),
+      // 默认关闭：自动重开浏览器复用用户 profile 会把已登录的会话弄丢（实测 2026-11-05）
+      refreshOnAuthFail: bool(env.PROTOCOL_REFRESH_ON_AUTH_FAIL, false),
       // 刷新后仍失败，是否降级到 hybrid 全浏览器
-      fallbackToHybrid: bool(env.PROTOCOL_FALLBACK_HYBRID, true),
+      // 默认关闭：降级同样会拉起浏览器，失败时直接返回 401 + nextAction
+      fallbackToHybrid: bool(env.PROTOCOL_FALLBACK_HYBRID, false),
+      // 策略闸门：任何“自动启动浏览器（采集/刷新凭据）”都必须显式授权。
+      // 只有用户手动执行 npm run auth:hybrid 才能复用登录 profile。
+      allowBrowserRefresh: bool(env.ALLOW_BROWSER_REFRESH, false),
       // 采集凭据时页面停留时间（给风控 SDK 写 hif 缓存的余量）
       harvestWaitMs: int(env.PROTOCOL_HARVEST_WAIT_MS, 2500),
       // token 年龄硬阈值：超过即 credentialState=invalid（实测缓存 13.07h 必然 INVALID_TOKEN）

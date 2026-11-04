@@ -191,11 +191,25 @@ export class ProtocolEngine {
     return file;
   }
 
+  #assertBrowserRefreshAllowed(context) {
+    // 策略闸门：浏览器只能由用户显式命令打开（npm run auth:hybrid）。
+    // 自动刷新/降级重开用户 profile 实测会让已登录会话失效，所以默认拒绝。
+    if (this.config.protocol.allowBrowserRefresh === true) return;
+    const err = new Error(
+      `refresh_blocked_by_policy：自动打开浏览器已被策略禁止（ALLOW_BROWSER_REFRESH=false，${context}）。` +
+        '请手动运行 npm run auth:hybrid 重新登录。',
+    );
+    err.code = 'refresh_blocked_by_policy';
+    this.log.warn?.('refresh_blocked_by_policy', { context, reason: this.lastReason });
+    throw err;
+  }
+
   async #loadOrHarvest(force) {
     let loaded = force ? [] : this.#loadAllCredentials();
     if (loaded.length) {
       this.credentialSource = loaded.length > 1 ? `cache:${loaded.length}-accounts` : 'cache';
     } else {
+      this.#assertBrowserRefreshAllowed(force ? 'auth-refresh' : 'startup-harvest');
       const creds = await harvestCredentials({ config: this.config, logger: this.log });
       const file = this.#saveCredential(creds);
       this.credentialSource = 'harvested';
@@ -250,6 +264,8 @@ export class ProtocolEngine {
   }
 
   async #refreshCredentials() {
+    // 先过策略闸门，再关旧引擎：避免“已经关掉账号、浏览器又起不来”的半死状态
+    this.#assertBrowserRefreshAllowed('auth-refresh');
     this.log.warn('协议通道：凭据疑似失效，从浏览器 profile 刷新一次', {
       reason: this.lastReason,
       source: this.credentialSource,
@@ -292,7 +308,9 @@ export class ProtocolEngine {
           } catch (refreshErr) {
             // 采集失败（profile 未登录 / 浏览器起不来）本身就是降级理由
             this.lastReason = `凭据刷新失败: ${refreshErr.message}`;
-            this.log.warn('协议通道：凭据刷新失败', { reason: refreshErr.message });
+            this.log.warn?.('协议通道：凭据刷新失败', { reason: refreshErr.message, code: refreshErr.code });
+            // 策略拒绝：不再降级（降级同样要起浏览器），直接把可执行错误抛给客户端
+            if (refreshErr.code === 'refresh_blocked_by_policy') throw refreshErr;
           }
         }
         if (this.config.protocol.fallbackToHybrid === false) {
