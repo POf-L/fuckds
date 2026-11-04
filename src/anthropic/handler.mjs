@@ -55,6 +55,7 @@ export function createAnthropicHandler({ config, log, runChat, sendJson }) {
         ms: result.elapsedMs,
         toolCalls: result.toolCalls.length,
         fabricated: result.fabricated,
+        protocol: result.protocol,
       });
       return sendJson(res, 200, payload);
     }
@@ -185,6 +186,7 @@ export function createAnthropicHandler({ config, log, runChat, sendJson }) {
         ms: result.elapsedMs,
         toolCalls: result.toolCalls.length,
         fabricated: result.fabricated,
+        protocol: result.protocol,
       });
       sse.end();
     } catch (err) {

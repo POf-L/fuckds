@@ -1,6 +1,11 @@
 import { findDsmlBlocks, findDsmlStart } from '../prompt/dsml.mjs';
 import { findPendingProtocolTag, stripProtocolTags } from '../prompt/sanitize.mjs';
 import { canonicalArguments, readJsonObject } from '../prompt/tools.mjs';
+import {
+  findPendingTextSentinel,
+  scanTextToolCallBlocks,
+  scanTextToolResultBlocks,
+} from '../prompt/text-protocol.mjs';
 
 /**
  * 协议行识别。
@@ -121,6 +126,17 @@ export function findNativeToolTokenBlocks(text) {
 export function findToolMarkup(text) {
   const blocks = [];
   if (!text) return blocks;
+
+  // 纯文本哨兵调用块：[[TOOL_CALL]]{...}[[/TOOL_CALL]]（对外唯一协议）
+  for (const block of scanTextToolCallBlocks(text)) {
+    blocks.push({ kind: 'TOOL_CALL', start: block.start, end: block.end, hasJson: block.complete });
+  }
+
+  // 纯文本哨兵结果块：模型不该写（真正结果由系统写进历史），出现即视为伪造
+  for (const block of scanTextToolResultBlocks(text)) {
+    if (covered(blocks, block.start)) continue;
+    blocks.push({ kind: 'RESULT', start: block.start, end: block.end, hasJson: block.complete });
+  }
 
   // <tool_call>{...}</tool_call>（带属性 / <tool_calls> 也认）
   const xmlPattern = /<tool_calls?\b[^>]*>[\s\S]*?<\/tool_calls?>/gi;
@@ -491,6 +507,14 @@ function pendingProtocolStart(text, from) {
 
   const lt = text.lastIndexOf('<');
   if (lt >= start && PENDING_NATIVE_TOKEN.test(text.slice(lt))) candidates.push(lt);
+
+  // 半截纯文本哨兵：`[[TOO`、`[[TOOL_CALL]]{"name"...`（还没闭合）→ 先扣住
+  const pendingSentinel = findPendingTextSentinel(text, start);
+  if (pendingSentinel >= 0) candidates.push(pendingSentinel);
+  const openBlock = scanTextToolCallBlocks(text, start).find((block) => !block.complete);
+  if (openBlock) candidates.push(openBlock.start);
+  const openResult = scanTextToolResultBlocks(text, start).find((block) => !block.complete);
+  if (openResult) candidates.push(openResult.start);
 
   const lineStart = text.lastIndexOf('\n') + 1;
   if (lineStart >= start) {

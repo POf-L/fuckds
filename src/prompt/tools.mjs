@@ -1,18 +1,21 @@
 /**
  * 工具声明 / 调用解析。
  *
- * 约定（与网页 prompt 中的 ## Tool_functions 段落一致）：
- *   {"name":"exec_shell","description":"Exec shell command","parameters":{...}}
+ * 对外协议只有一种：**纯文本哨兵 + JSON**（见 text-protocol.mjs）：
+ *   [[TOOL_CALL]]{"name":"bash","arguments":{"command":"dir"}}[[/TOOL_CALL]]
  *
- * 模型输出工具调用只走一种语法：**原生 DSML**（XML 风格调用，见 dsml.mjs）。
- * 解析层把它转成标准 tool_calls / tool_use，再从 content / SSE 里剔除；
- * 历史里绝不回写 DSML，只写 ## Tool_calls 段的 JSON 行。
+ * 声明用 ## Tool_functions 段里每行一个 JSON；历史里的调用 / 结果用同一套哨兵回写。
+ * 全程不含 XML 标签 —— 网页端会把 XML 协议标签当成风控信号。
  *
- * 为了不丢调用，<tool_call> JSON 和 <|tool▁calls▁begin|> 这类原生工具 token 仍然静默兜底解析，
- * 但不再区分、也不再记日志（它们不是对外协议，只是容错）。
+ * 为了不丢调用，DSML / <tool_call> / 原生工具 token / 旧版 DO 仍然静默兜底解析，
+ * 但它们不是对外协议，也不回写历史：模型没有可模仿的 XML 样板。
  */
 
 import { parseDsmlCalls } from './dsml.mjs';
+import { parseJsonLoose, readJsonContainer, readJsonObject } from './json-loose.mjs';
+import { parseTextToolCalls, TOOL_RESULT_CLOSE, TOOL_RESULT_OPEN } from './text-protocol.mjs';
+
+export { readJsonObject };
 
 /** 把 OpenAI tools 定义渲染成「每行一个 JSON」的工具列表 */
 export function renderToolDeclarations(tools = []) {
@@ -28,34 +31,10 @@ export function renderToolDeclarations(tools = []) {
   return lines;
 }
 
-/** 从文本里读取一个以 `{` 开头的完整 JSON 对象（考虑字符串与转义） */
-export function readJsonObject(text, start) {
-  if (text[start] !== '{') return null;
-  let depth = 0;
-  let inString = false;
-  let escaped = false;
-  for (let i = start; i < text.length; i += 1) {
-    const ch = text[i];
-    if (inString) {
-      if (escaped) escaped = false;
-      else if (ch === '\\') escaped = true;
-      else if (ch === '"') inString = false;
-      continue;
-    }
-    if (ch === '"') inString = true;
-    else if (ch === '{') depth += 1;
-    else if (ch === '}') {
-      depth -= 1;
-      if (depth === 0) return text.slice(start, i + 1);
-    }
-  }
-  return null; // 还没输出完，或者格式坏了
-}
-
 /**
  * 旧版 DO 行（`DO:{"name":...}`）的容错解析。
  *
- * 新协议里 prompt / 历史都不再出现 DO（历史调用走 ## Tool_calls 的 JSON 行），
+ * 新协议里 prompt / 历史都不再出现 DO（历史调用走 ## Tool_calls 的哨兵行），
  * 这里保留只是兜底：万一模型/旧客户端还吐 DO，不丢调用、也不报错、不记日志。
  */
 const DO_PATTERN = /\bDO\b[ \t*_`~]{0,6}[:：=][ \t*_`~]{0,6}\s*/g;
@@ -86,68 +65,9 @@ function stableStringify(value) {
   return JSON.stringify(value);
 }
 
-/** JSON.parse 的宽松版：修掉裸换行 / 尾随逗号再试一次（模型手写的 JSON 常见） */
-function parseJsonLoose(raw) {
-  if (typeof raw !== 'string' || !raw) return null;
-  try {
-    return JSON.parse(raw);
-  } catch {
-    // 继续尝试修复
-  }
-  try {
-    return JSON.parse(repairJsonText(raw));
-  } catch {
-    return null;
-  }
-}
-
-/** 转义字符串里的裸控制字符，并去掉对象 / 数组末尾多余的逗号 */
-function repairJsonText(text) {
-  let out = '';
-  let inString = false;
-  let escaped = false;
-  for (const ch of text) {
-    if (inString) {
-      if (escaped) {
-        out += ch;
-        escaped = false;
-        continue;
-      }
-      if (ch === '\\') {
-        out += ch;
-        escaped = true;
-        continue;
-      }
-      if (ch === '"') {
-        out += ch;
-        inString = false;
-        continue;
-      }
-      if (ch === '\n') {
-        out += '\\n';
-        continue;
-      }
-      if (ch === '\r') {
-        out += '\\r';
-        continue;
-      }
-      if (ch === '\t') {
-        out += '\\t';
-        continue;
-      }
-      out += ch;
-      continue;
-    }
-    if (ch === '"') inString = true;
-    out += ch;
-  }
-  return out.replace(/,\s*([}\]])/g, '$1');
-}
-
-/** 读出 `{` 开头的对象并宽松解析；不是对象 / 还没闭合就返回 null */
+/** 读出以 `{` / `[` 开头的 JSON 并宽松解析；不是 / 还没闭合就返回 null */
 function readJsonValue(text, start) {
-  if (text[start] !== '{') return null;
-  const raw = readJsonObject(text, start);
+  const raw = readJsonContainer(text, start);
   return raw ? parseJsonLoose(raw) : null;
 }
 
@@ -252,7 +172,7 @@ function parseNativeToolCalls(text, add) {
 /**
  * 解析模型回复中的工具调用。
  *
- * 顺序：DSML（唯一对外语法）→ <tool_call> → 原生 token → 旧版 DO 兜底；
+ * 顺序：纯文本哨兵（唯一对外协议）→ DSML → <tool_call> → 原生 token → 旧版 DO 兜底；
  * 最终按出现位置排序，用 canonicalArguments 去重
  * （同一次调用被模型用两种格式重复写出来时只保留一次）。
  *
@@ -279,12 +199,17 @@ export function parseToolCalls(text, knownTools = null) {
     calls.push({ name, arguments: argsJson, raw, index });
   };
 
-  // 1) DSML：唯一对外语法（全角 / 半角竖线、截断都能解析）
+  // 1) 纯文本哨兵：对外协议，最高优先级
+  for (const call of parseTextToolCalls(text)) {
+    add(call.name, call.args, call.raw, call.index);
+  }
+
+  // 2) DSML 兜底（模型可能仍按旧样板书输出 XML 风格调用）
   for (const call of parseDsmlCalls(text)) {
     add(call.name, call.arguments, call.raw, call.index);
   }
 
-  // 2) <tool_call>{...}</tool_call>：缺闭合标签时按截断处理
+  // 3) <tool_call>{...}</tool_call>：缺闭合标签时按截断处理
   XML_TOOL_PATTERN.lastIndex = 0;
   let xml;
   while ((xml = XML_TOOL_PATTERN.exec(text)) !== null) {
@@ -359,10 +284,13 @@ export function normalizeArguments(args) {
   return JSON.stringify(unwrapCallArguments(value));
 }
 
-/** 工具执行结果 -> ## Tool_call_result 段里的一行 JSON */
+/**
+ * 工具执行结果 -> ## Tool_call_result 段里的一行哨兵块。
+ * 形如：[[TOOL_RESULT]]{"name":"exec_shell","result":"Linux"}[[/TOOL_RESULT]]
+ */
 export function renderToolResult(name, content) {
   const result = typeof content === 'string' ? content : JSON.stringify(content);
-  return `${JSON.stringify({ name: name || 'unknown', result })}`;
+  return `${TOOL_RESULT_OPEN}${JSON.stringify({ name: name || 'unknown', result })}${TOOL_RESULT_CLOSE}`;
 }
 
 /** 统计工具名（给调用方做「模型调了没声明的工具」这类日志/诊断用） */

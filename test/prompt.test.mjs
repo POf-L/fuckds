@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 
 import { buildPrompt } from '../src/prompt/build.mjs';
 import { BASE_SYSTEM_RULES, SECTION, SPECIAL_TOKENS_HEADER } from '../src/prompt/special.mjs';
+import { scanProtocolTags } from '../src/prompt/sanitize.mjs';
 
 test('单轮：system + user，按 ## 段落拼接', () => {
   const { prompt } = buildPrompt({
@@ -89,15 +90,21 @@ test('tool 调用单独成 ## Tool_calls 段，结果单独成 ## Tool_call_resu
   const nextUserAt = prompt.lastIndexOf('## User:');
 
   assert.ok(toolCallsAt > 0 && toolResultAt > toolCallsAt && nextUserAt > toolResultAt);
-  assert.ok(prompt.includes('## Tool_calls:\n{"name":"exec_shell","args":{"command":"uname -a"}}'));
-  // 历史里绝不出现 DSML / DO / <tool_call> 等输出语法（协议提示词里教 DSML 是允许的）
+  assert.ok(
+    prompt.includes(
+      '## Tool_calls:\n[[TOOL_CALL]]{"name":"exec_shell","arguments":{"command":"uname -a"}}[[/TOOL_CALL]]',
+    ),
+  );
+  // 历史里绝不出现 DSML / DO / 任何 XML 调用语法（协议提示词本身也不含标签）
   const history = prompt.slice(prompt.indexOf('## User:'));
-  assert.ok(!history.includes('DSML'));
-  assert.ok(!history.includes('<tool_call>'));
-  assert.ok(!history.includes('DO:{'));
+  for (const tag of ['DSML', '<tool_call>', '<function_calls>', '<invoke>', '<parameter>', '<antml:', 'DO:{']) {
+    assert.ok(!history.includes(tag), `历史里出现了 ${tag}`);
+  }
 
   const afterHeader = toolResultAt + '## Tool_call_result:'.length;
-  const result = JSON.parse(prompt.slice(afterHeader + 1, prompt.indexOf('\n', afterHeader + 1)));
+  const resultLine = prompt.slice(afterHeader + 1, prompt.indexOf('\n', afterHeader + 1));
+  assert.ok(resultLine.startsWith('[[TOOL_RESULT]]') && resultLine.endsWith('[[/TOOL_RESULT]]'));
+  const result = JSON.parse(resultLine.slice('[[TOOL_RESULT]]'.length, -'[[/TOOL_RESULT]]'.length));
   assert.equal(result.name, 'exec_shell');
   assert.equal(result.result, 'Linux ubuntu 6.1');
 
@@ -129,8 +136,8 @@ test('连续多个 tool 结果合并到同一个 ## Tool_call_result 段', () =>
 
   const occurrences = prompt.match(/## Tool_call_result:/g) ?? [];
   assert.equal(occurrences.length, 1);
-  assert.ok(prompt.includes('{"name":"a","result":"结果 A"}'));
-  assert.ok(prompt.includes('{"name":"b","result":"结果 B"}'));
+  assert.ok(prompt.includes('[[TOOL_RESULT]]{"name":"a","result":"结果 A"}[[/TOOL_RESULT]]'));
+  assert.ok(prompt.includes('[[TOOL_RESULT]]{"name":"b","result":"结果 B"}[[/TOOL_RESULT]]'));
 });
 
 test('assistant 同时有正文和工具调用：正文进 Assistant，调用进 Tool_calls', () => {
@@ -149,11 +156,15 @@ test('assistant 同时有正文和工具调用：正文进 Assistant，调用进
   });
 
   assert.match(prompt, /## Assistant:\n好的\n< \| \| END \| \| >/);
-  assert.match(prompt, /## Tool_calls:\n\{"name":"exec_shell","args":\{"command":"uname -r"\}\}\n\{"name":"read_file","args":\{"path":"\/etc\/hosts"\}\}/);
-  // 历史里绝不能出现 DSML / native 调用语法（协议提示词里教 DSML 是允许的）
+  assert.match(
+    prompt,
+    /## Tool_calls:\n\[\[TOOL_CALL\]\]\{"name":"exec_shell","arguments":\{"command":"uname -r"\}\}\[\[\/TOOL_CALL\]\]\n\[\[TOOL_CALL\]\]\{"name":"read_file","arguments":\{"path":"\/etc\/hosts"\}\}\[\[\/TOOL_CALL\]\]/,
+  );
+  // 历史里绝不能出现 XML 协议标签 / 原生调用语法（协议提示词本身也不含标签）
   const history = prompt.slice(prompt.indexOf('## User:'));
-  assert.ok(!history.includes('DSML'));
-  assert.ok(!history.includes('<tool_call>'));
+  for (const tag of ['DSML', '<tool_call>', '<function_calls>', '<invoke>', '<parameter>', '<antml:']) {
+    assert.ok(!history.includes(tag), `历史里出现了 ${tag}`);
+  }
 });
 
 test('systemExtra 追加在 SYSTEM 段末尾（协议提示词之前）', () => {
@@ -200,12 +211,15 @@ test('空 messages 报错', () => {
   assert.throws(() => buildPrompt({ messages: [] }), /messages 不能为空/);
 });
 
-test('协议声明：教原生 DSML 输出格式，不要求 DO', () => {
-  assert.ok(SPECIAL_TOKENS_HEADER.includes('<｜DSML｜ calls>'));
-  assert.ok(SPECIAL_TOKENS_HEADER.includes('invoke name='));
-  assert.ok(SPECIAL_TOKENS_HEADER.includes('parameter name='));
+test('协议声明：教纯文本哨兵调用，不教任何 XML 标签', () => {
+  assert.ok(SPECIAL_TOKENS_HEADER.includes('[[TOOL_CALL]]'));
+  assert.ok(SPECIAL_TOKENS_HEADER.includes('[[/TOOL_CALL]]'));
+  assert.ok(SPECIAL_TOKENS_HEADER.includes('"name"'));
+  assert.ok(SPECIAL_TOKENS_HEADER.includes('"arguments"'));
   assert.ok(!SPECIAL_TOKENS_HEADER.includes('DO:{"name"'));
   assert.ok(!SPECIAL_TOKENS_HEADER.includes('封禁'));
+  // 协议声明本身不能触发上送前守卫
+  assert.equal(scanProtocolTags(SPECIAL_TOKENS_HEADER).count, 0, '协议提示词里混进了 XML 协议标签');
 });
 
 test('段落常量与新协议一致', () => {

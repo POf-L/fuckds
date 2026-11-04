@@ -32,7 +32,7 @@ export function normalizeChatRequest(body, config) {
   let tools = incomingTools;
 
   if (config.sanitize?.stripClientTools) {
-    // 网页端产不出 tool_calls：工具定义只会把 XML / JSON 协议写进 prompt，默认整包丢弃
+    // 实验模式：故意丢弃工具定义（纯聊天 / 省 token）
     stripped.tools = incomingTools.length;
     stripped.toolChoice = body.tool_choice !== undefined;
     tools = [];
@@ -45,6 +45,11 @@ export function normalizeChatRequest(body, config) {
           param: `tools[${i}]`,
         });
       }
+    }
+    // tool_choice="none" 是客户端明确要求「这轮别调工具」，按语义不渲染
+    if (body.tool_choice === 'none' && tools.length) {
+      stripped.tools = tools.length;
+      tools = [];
     }
   }
 

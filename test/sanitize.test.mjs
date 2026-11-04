@@ -13,7 +13,7 @@ import {
   sanitizeMessages,
   stripProtocolTags,
 } from '../src/prompt/sanitize.mjs';
-import { BASE_SYSTEM_RULES, DSML_PROTOCOL_SECTION, SPECIAL_TOKENS_HEADER } from '../src/prompt/special.mjs';
+import { BASE_SYSTEM_RULES, SPECIAL_TOKENS_HEADER, TOOL_PROTOCOL_SECTION } from '../src/prompt/special.mjs';
 import { makeConfig } from './helpers/browser.mjs';
 
 /** 最终上送 prompt 的验收匹配器：任何一个协议标签家族出现都算失败 */
@@ -66,7 +66,7 @@ const TWELVE_TOOLS = Array.from({ length: 12 }, (_, i) => ({
   },
 }));
 
-test('opencode 真实形态：归一化后 prompt 里协议标签次数为 0，普通 XML 示例保留', () => {
+test('opencode 真实形态：工具渲染进 prompt，协议标签次数为 0，普通 XML 示例保留', () => {
   const request = normalizeChatRequest(
     {
       model: 'deepseek-flash',
@@ -82,9 +82,9 @@ test('opencode 真实形态：归一化后 prompt 里协议标签次数为 0，�
     makeConfig(),
   );
 
-  // 默认丢弃客户端工具：12 个定义不进 prompt
-  assert.equal(request.tools.length, 0);
-  assert.deepEqual(request.sanitize.stripped, { tools: 12, toolChoice: true });
+  // 默认保留并渲染客户端工具：agent / 多步工具调用要能闭环
+  assert.equal(request.tools.length, 12);
+  assert.deepEqual(request.sanitize.stripped, { tools: 0, toolChoice: false });
   assert.ok(request.sanitize.markup.count > 0, '应记录命中数量');
 
   const { prompt } = buildPrompt({ messages: request.messages, tools: request.tools });
@@ -96,17 +96,18 @@ test('opencode 真实形态：归一化后 prompt 里协议标签次数为 0，�
   assert.ok(prompt.includes('<book id="1">'), '普通 XML 示例被删掉了');
   assert.ok(prompt.includes('<item>chapter 1</item>'), '普通 XML 示例被删掉了');
 
-  // 没有工具声明时不再教 DSML（否则又要把标签写回 prompt）
-  assert.ok(!prompt.includes(DSML_PROTOCOL_SECTION.trim()), '无工具时不该出现 DSML 协议说明');
-  assert.ok(prompt.includes(BASE_SYSTEM_RULES.trim()));
+  // 工具声明按纯文本 JSON 行渲染，并带纯文本哨兵协议说明（不含任何 XML 标签）
+  assert.ok(prompt.includes('"name":"tool_0"'), '工具定义没渲染进 prompt');
+  assert.ok(prompt.includes(TOOL_PROTOCOL_SECTION.trim()), '有工具时应给出纯文本调用协议');
+  assert.equal(scanProtocolTags(TOOL_PROTOCOL_SECTION).count, 0, '协议说明自身混进了 XML 标签');
 
   // 自检对最终 prompt 也必须通过
   assert.equal(scanProtocolTags(prompt).count, 0);
   assertNoProtocolTags(prompt);
 });
 
-test('显式保留工具（STRIP_CLIENT_TOOLS=false）时：工具定义保留且同样被清洗', () => {
-  const config = makeConfig({ STRIP_CLIENT_TOOLS: 'false' });
+test('显式丢弃工具（STRIP_CLIENT_TOOLS=true）时：工具定义不进 prompt，只留基础规则', () => {
+  const config = makeConfig({ STRIP_CLIENT_TOOLS: 'true' });
   const request = normalizeChatRequest(
     {
       model: 'deepseek-flash',
@@ -119,17 +120,14 @@ test('显式保留工具（STRIP_CLIENT_TOOLS=false）时：工具定义保留�
     config,
   );
 
-  assert.equal(request.tools.length, 12);
-  assert.equal(request.sanitize.stripped.tools, 0);
-  const built = buildPrompt({ messages: request.messages, tools: request.tools });
-  const { prompt } = built;
+  assert.equal(request.tools.length, 0);
+  assert.equal(request.sanitize.stripped.tools, 12);
+  const { prompt } = buildPrompt({ messages: request.messages, tools: request.tools });
 
-  // 工具描述 / schema 里的标签同样被清掉（服务端自带的协议说明不计入）
-  const userAndTools = prompt.split(built.protocolText).join('');
-  assert.equal(scanProtocolTags(userAndTools).count, 0);
-  // 有工具时仍保留 DSML 协议说明（这是显式实验开关的预期）
-  assert.ok(prompt.includes(SPECIAL_TOKENS_HEADER.trim()));
-  assert.equal(SPECIAL_TOKENS_HEADER, `${BASE_SYSTEM_RULES.trim()}\n\n${DSML_PROTOCOL_SECTION.trim()}`);
+  assert.equal(scanProtocolTags(prompt).count, 0);
+  assert.ok(prompt.includes(BASE_SYSTEM_RULES.trim()));
+  assert.ok(!prompt.includes('[[TOOL_CALL]]'), '没有工具时不该教调用协议');
+  assert.equal(SPECIAL_TOKENS_HEADER, `${BASE_SYSTEM_RULES.trim()}\n\n${TOOL_PROTOCOL_SECTION.trim()}`);
 });
 
 test('SANITIZE_MARKUP=false：文本原样保留，命中只计数不修改', () => {
@@ -143,7 +141,7 @@ test('SANITIZE_MARKUP=false：文本原样保留，命中只计数不修改', ()
   assert.deepEqual(hits.byName, { dsml: 2, invoke: 2 });
 });
 
-test('Anthropic：tools 默认丢弃，system / 历史 / tool_result 都被清洗', () => {
+test('Anthropic：tools 默认保留（清洗标签），system / 历史 / tool_result 都被清洗', () => {
   const request = normalizeMessagesRequest(
     {
       model: 'deepseek-flash',
@@ -162,8 +160,8 @@ test('Anthropic：tools 默认丢弃，system / 历史 / tool_result 都被清�
     makeConfig(),
   );
 
-  assert.equal(request.tools.length, 0);
-  assert.equal(request.sanitize.stripped.tools, 1);
+  assert.equal(request.tools.length, 1);
+  assert.equal(request.sanitize.stripped.tools, 0);
   const { prompt } = buildPrompt({ messages: request.messages, tools: request.tools });
   assert.equal(scanProtocolTags(prompt).count, 0);
   assert.ok(prompt.includes('<book id="1">'), '普通 XML 示例被误删');

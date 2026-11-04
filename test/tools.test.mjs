@@ -96,9 +96,11 @@ test('render: 工具声明忽略没有名字的项', () => {
   assert.equal(JSON.parse(lines[1]).name, 'b');
 });
 
-test('render: Tool_call_result 段的一行 JSON', () => {
+test('render: Tool_call_result 段的一行哨兵块', () => {
   const line = renderToolResult('exec_shell', 'Linux');
-  const parsed = JSON.parse(line);
+  assert.ok(line.startsWith('[[TOOL_RESULT]]'));
+  assert.ok(line.endsWith('[[/TOOL_RESULT]]'));
+  const parsed = JSON.parse(line.slice('[[TOOL_RESULT]]'.length, -'[[/TOOL_RESULT]]'.length));
   assert.deepEqual(parsed, { name: 'exec_shell', result: 'Linux' });
 });
 

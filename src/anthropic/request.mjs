@@ -58,12 +58,17 @@ export function normalizeMessagesRequest(body, config) {
   const stripped = { tools: 0, toolChoice: false };
   let tools;
   if (config.sanitize?.stripClientTools) {
-    // 网页端产不出 tool_calls：Anthropic 的 tools 同样默认整包丢弃
+    // 实验模式：故意丢弃工具定义（纯聊天 / 省 token）
     stripped.tools = Array.isArray(body.tools) ? body.tools.length : 0;
     stripped.toolChoice = body.tool_choice !== undefined;
     tools = [];
   } else {
     tools = normalizeTools(body.tools);
+    // tool_choice:{type:"none"} = 这轮别调工具，按语义不渲染
+    if (body.tool_choice?.type === 'none' && tools.length) {
+      stripped.tools = tools.length;
+      tools = [];
+    }
   }
 
   // 归一化阶段清掉 XML 协议标签：system / 对话历史 / tool_result / 工具定义

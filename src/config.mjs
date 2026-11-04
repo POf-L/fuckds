@@ -105,9 +105,10 @@ export function loadConfig(env = process.env) {
     engine: str(env.ENGINE, 'auto'),
     // 上送 prompt 前的协议标签清洗（网页端会把 XML 协议标签当风控信号）
     sanitize: {
-      // 客户端传入的 tools / tool_choice 默认整包丢弃：网页端本来就产不出 tool_calls，
-      // 留着只会把工具定义写进 prompt，既没用又放大风控面。实验时可显式关掉。
-      stripClientTools: bool(env.STRIP_CLIENT_TOOLS, true),
+      // 客户端 tools / tool_choice 默认**保留并渲染**进 prompt（纯文本协议，见
+      // src/prompt/text-protocol.mjs），这样 agent / 多步工具调用才能闭环。
+      // 只有显式 STRIP_CLIENT_TOOLS=true 才丢弃（纯聊天、压缩上下文的实验模式）。
+      stripClientTools: bool(env.STRIP_CLIENT_TOOLS, false),
       // 对 system / user / assistant / 工具结果 / 附件名做 XML 协议标签清洗
       markup: bool(env.SANITIZE_MARKUP, true),
       // 上送前自检：拼好的 prompt 里一旦仍有协议标签就拒绝发送（不静默带出）

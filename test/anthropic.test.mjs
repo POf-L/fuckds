@@ -225,11 +225,15 @@ test('Anthropic：tool_use / tool_result 历史转换成 Tool_calls + Tool_call_
     const json = await res.json();
     assert.equal(json.stop_reason, 'end_turn');
 
-    // 历史里的 tool_use 渲染成 ## Tool_calls 段里的 JSON 行（绝不写 DSML / DO）
-    assert.match(web.lastPrompt, /## Tool_calls:\n\{"name":"exec_shell","args":\{"command":"uname -r"\}\}/);
+    // 历史里的 tool_use 回写成 ## Tool_calls 段里的纯文本哨兵块（绝不写 DSML / DO / 任何 XML）
+    assert.match(
+      web.lastPrompt,
+      /## Tool_calls:\n\[\[TOOL_CALL\]\]\{"name":"exec_shell","arguments":\{"command":"uname -r"\}\}\[\[\/TOOL_CALL\]\]/,
+    );
     const history = web.lastPrompt.slice(web.lastPrompt.indexOf('## User:'));
-    assert.ok(!history.includes('DSML'), '历史里不该出现 DSML');
-    assert.ok(!history.includes('DO:{'), '历史里不该出现 DO');
+    for (const tag of ['DSML', 'DO:{', '<tool_call>', '<invoke>', '<parameter>', '<antml:']) {
+      assert.ok(!history.includes(tag), `历史里不该出现 ${tag}`);
+    }
     assert.match(web.lastPrompt, /## Tool_call_result:/);
     assert.match(web.lastPrompt, /6\.1\.0/);
     // 工具结果不能混进 assistant 段

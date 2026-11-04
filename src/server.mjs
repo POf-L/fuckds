@@ -182,6 +182,7 @@ export function createServer({ config, logger, web }) {
         ms: result.elapsedMs,
         toolCalls: result.toolCalls.length,
         fabricated: result.fabricated,
+        protocol: result.protocol,
       });
       return sendJson(res, 200, payload);
     }
@@ -302,6 +303,7 @@ export function createServer({ config, logger, web }) {
         ms: result.elapsedMs,
         toolCalls: toolCalls.length,
         fabricated: result.fabricated,
+        protocol: result.protocol,
       });
       sse.done();
     } catch (err) {

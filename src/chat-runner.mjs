@@ -10,6 +10,7 @@ import {
 import { buildPrompt } from './prompt/build.mjs';
 import { planOverflow } from './prompt/overflow.mjs';
 import { assertNoProtocolTags } from './prompt/sanitize.mjs';
+import { parseTextToolCalls, scanTextToolCallBlocks } from './prompt/text-protocol.mjs';
 import { parseToolCalls } from './prompt/tools.mjs';
 
 /**
@@ -86,8 +87,8 @@ export function createChatRunner({ config, log, web }) {
     /**
      * 把一段原始输出整理成协议无关的语义：有效工具调用 + 干净正文。
      *
-     * 模型输出的工具调用走原生 DSML（唯一协议），解析层转成标准 tool_calls；
-     * 其他历史格式（<tool_call> / 原生 token / 旧版 DO）只做静默兜底，不再记日志。
+     * 模型输出的工具调用走纯文本哨兵协议（唯一对外协议），解析层转成标准 tool_calls；
+     * DSML / <tool_call> / 原生 token / 旧版 DO 只做静默兜底。
      */
     const evaluate = (text) => {
       const parsed = parseToolCalls(text, knownTools);
@@ -95,6 +96,22 @@ export function createChatRunner({ config, log, web }) {
       // 按签名去重会把整轮输出吞成空回答。
       const toolCalls = parsed;
       const content = stripToolMarkup(text);
+
+      // 纯文本协议的成功率：只在模型真的写了哨兵块时统计。
+      // blocks = 完整调用块数，parsed = 能从块里解出的调用数；解析不出来就降级成普通文本（不抛错）。
+      const callBlocks = scanTextToolCallBlocks(text).filter((block) => block.complete);
+      const textCalls = parseTextToolCalls(text);
+      const protocol = {
+        blocks: callBlocks.length,
+        parsed: textCalls.length,
+        failed: callBlocks.length > 0 && textCalls.length === 0 ? 1 : 0,
+      };
+      if (protocol.failed) {
+        log?.warn('纯文本工具调用块解析失败，已降级为普通文本', {
+          blocks: protocol.blocks,
+          sample: text.slice(callBlocks[0].start, callBlocks[0].end).slice(0, 300),
+        });
+      }
 
       // 诊断（只记日志，不改行为）：这一轮既没有正文、也没有工具调用时，客户端收到的是一条
       // 空 assistant 消息，agent 那边会直接判「模型未返回正文或工具调用」把整轮 loop 判失败。
@@ -135,6 +152,8 @@ export function createChatRunner({ config, log, web }) {
         content,
         // RESULT / 伪造的 ## 段落标题都算「编造协议」
         fabricated: hasFabricatedProtocol(text),
+        // 纯文本协议解析统计（blocks=完整调用块，parsed=解出的调用，failed=整体失败）
+        protocol,
       };
     };
 

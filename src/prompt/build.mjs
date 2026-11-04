@@ -9,6 +9,7 @@ import {
   SPECIAL_TOKENS_HEADER,
 } from './special.mjs';
 import { collectToolNames, renderToolDeclarations, renderToolResult } from './tools.mjs';
+import { TOOL_CALL_CLOSE, TOOL_CALL_OPEN } from './text-protocol.mjs';
 
 const VALID_ROLES = new Set(['system', 'developer', 'user', 'assistant', 'tool', 'function']);
 
@@ -34,10 +35,10 @@ const VALID_ROLES = new Set(['system', 'developer', 'user', 'assistant', 'tool',
  *   你好！有什么可以帮你？
  *
  *   ## Tool_calls:
- *   {"name":"exec_shell","args":{"command":"uname -a"}}
+ *   [[TOOL_CALL]]{"name":"exec_shell","arguments":{"command":"uname -a"}}[[/TOOL_CALL]]
  *
  *   ## Tool_call_result:
- *   {"name":"exec_shell","result":"Linux"}
+ *   [[TOOL_RESULT]]{"name":"exec_shell","result":"Linux"}[[/TOOL_RESULT]]
  *
  *   ## User:
  *   解释一下
@@ -45,8 +46,8 @@ const VALID_ROLES = new Set(['system', 'developer', 'user', 'assistant', 'tool',
  * 顺序：客户端 system 在最上面，自带协议提示词夹在中间，工具声明和对话历史（user）在后面。
  *
  * 注意两件事：
- * - 模型输出工具调用走原生 DSML（见 special.mjs），但**历史里绝不回写 DSML**：
- *   已发生的调用统一渲染成 ## Tool_calls 段的 JSON 行，模型没有可模仿的语法样板；
+ * - 模型输出工具调用走纯文本哨兵协议（见 special.mjs），**历史里回写同一套哨兵**，
+ *   模型看到的是「自己以前也这么写」，格式更稳；全程不出现任何 XML 标签。
  * - 工具结果**单独成段**（## Tool_call_result），不塞进 ## Assistant，
  *   模型就不会把「assistant 说调用、然后自己写结果」当成正确的模仿对象。
  */
@@ -89,7 +90,7 @@ export function buildPrompt({ messages, tools = [], systemExtra = '' }) {
         if (!fn.name) continue;
         callLines.push(renderToolCall(fn.name, fn.arguments));
       }
-      // 历史调用单独成段：只写 JSON，不写 DSML / DO，避免模型照抄语法
+      // 历史调用单独成段：回写与模型输出完全一致的哨兵块，模型没有第二种语法可学
       if (callLines.length) sections.push({ role: 'toolCalls', lines: callLines });
 
       if (!text.trim() && !callLines.length) sections.push({ role: 'assistant', lines: [''] });
@@ -122,7 +123,7 @@ export function buildPrompt({ messages, tools = [], systemExtra = '' }) {
   }
 
   // 自带的协议提示词：单独一个 system 块，放在 TOOL_FUNCTIONS 之后、USER 之前。
-  // 没有工具声明时只放基础规则：网页端产不出 tool_calls，教 DSML 只会把 XML 标签写进 prompt。
+  // 有工具声明时教纯文本哨兵协议（可解析成 tool_calls）；没有工具时只放基础规则。
   const protocolText = (toolLines.length ? SPECIAL_TOKENS_HEADER : BASE_SYSTEM_RULES).trim();
   parts.push('', SECTION.system, protocolText);
 
@@ -157,10 +158,10 @@ function findLastToolName(sections) {
   for (let i = sections.length - 1; i >= 0; i -= 1) {
     if (sections[i].role !== 'toolCalls') continue;
     for (let j = sections[i].lines.length - 1; j >= 0; j -= 1) {
-      const line = sections[i].lines[j];
-      if (!line.startsWith('{')) continue;
+      const body = toolCallBodyOf(sections[i].lines[j]);
+      if (!body) continue;
       try {
-        const parsed = JSON.parse(line);
+        const parsed = JSON.parse(body);
         if (parsed && typeof parsed.name === 'string') return parsed.name;
       } catch {
         return null;
@@ -170,9 +171,19 @@ function findLastToolName(sections) {
   return null;
 }
 
+/** 从一行历史（哨兵块或旧版裸 JSON）里取出 JSON 正文 */
+function toolCallBodyOf(line) {
+  if (!line) return null;
+  if (line.startsWith(TOOL_CALL_OPEN) && line.endsWith(TOOL_CALL_CLOSE)) {
+    return line.slice(TOOL_CALL_OPEN.length, -TOOL_CALL_CLOSE.length);
+  }
+  if (line.startsWith('{')) return line;
+  return null;
+}
+
 /**
- * 把一次工具调用渲染成历史里给模型看的一行 JSON（绝不写 DSML / DO）。
- * 形如：{"name":"exec_shell","args":{"command":"uname -a"}}
+ * 把一次工具调用渲染成历史里给模型看的一行（绝不写 DSML / DO）。
+ * 形如：[[TOOL_CALL]]{"name":"exec_shell","arguments":{"command":"uname -a"}}[[/TOOL_CALL]]
  */
 function renderToolCall(name, args) {
   let parsed = {};
@@ -187,5 +198,5 @@ function renderToolCall(name, args) {
     parsed = args;
   }
 
-  return JSON.stringify({ name, args: parsed });
+  return `${TOOL_CALL_OPEN}${JSON.stringify({ name, arguments: parsed })}${TOOL_CALL_CLOSE}`;
 }
