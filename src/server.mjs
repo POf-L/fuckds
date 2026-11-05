@@ -141,6 +141,12 @@ export function createServer({ config, logger, web }) {
       if (apiError.code === 'deepseek_auth_required') {
         log.warn('登录态失效：请运行 `npm run auth:hybrid` 重新登录（使用手册 §6；无需手动复制 token）');
       }
+      if (apiError.code === 'challenge_required') {
+        // 明确告诉客户端“不要重试”：上游要求人工完成挑战，任何自动重试都只会放大请求。
+        // 429 + Retry-After 只是兜底；真正让客户端停下来的是这条头 + body 里的 retryable=false。
+        res.setHeader('x-should-retry', 'false');
+        log.warn('上游要求人机挑战（40303/CHALLENGE_REQUIRED）：已停止重试，请在已登录浏览器里运行 `npm run recover:challenge` 完成挑战');
+      }
       if (apiError.status === 429) {
         const seconds = Math.ceil((err.retryAfterMs ?? 60_000) / 1000);
         res.setHeader('Retry-After', String(seconds));
@@ -330,9 +336,16 @@ export function createServer({ config, logger, web }) {
       // 否则 200 + 只有 error 帧的空流会被客户端当成「模型空回答」立刻重试，
       // 限流期间会变成高频空转（实测 opencode 会在 60 秒冷却里连打十几次）。
       if (!res.headersSent) {
+        if (apiError.code === 'challenge_required') {
+          // 流式请求同理：还没发出 SSE 字节时，用明确的 429 + x-should-retry:false 让客户端停手。
+          res.setHeader('x-should-retry', 'false');
+        }
         if (apiError.status === 429) {
           const seconds = Math.ceil((err.retryAfterMs ?? 60_000) / 1000);
           res.setHeader('Retry-After', String(seconds));
+        }
+        if (apiError.code === 'challenge_required') {
+          log.warn('上游要求人机挑战（40303/CHALLENGE_REQUIRED）：流式请求已停止，请运行 `npm run recover:challenge`');
         }
         if (!(err instanceof ApiError) || apiError.status >= 500) log.warn('流式失败:', err.message);
         return sendJson(res, apiError.status, apiError.toJSON());

@@ -1,6 +1,14 @@
 import crypto from 'node:crypto';
 
-import { ApiError, AuthExpiredError, PromptTooLongError, RateLimitError, TimeoutError, UpstreamError } from '../errors.mjs';
+import {
+  ApiError,
+  AuthExpiredError,
+  ChallengeRequiredError,
+  PromptTooLongError,
+  RateLimitError,
+  TimeoutError,
+  UpstreamError,
+} from '../errors.mjs';
 import { sleep } from '../util.mjs';
 import { AccountPool } from './account-pool.mjs';
 import { AccountScheduler } from './scheduler.mjs';
@@ -40,8 +48,22 @@ export const AUTH_INVALID_COOLDOWN_MS = 24 * 60 * 60_000;
  */
 export const MUTED_COOLDOWN_MS = 15 * 60_000;
 
+/**
+ * 人机挑战闸门：同一会话/同一请求指纹 60s 内只允许 1 次上游尝试。
+ *
+ * 即使客户端（opencode）仍把 429 当可重试，第二次请求也会在这里被直接拒绝，
+ * 不会再触达 create_session / PoW / completion，避免 22 条放大重演。
+ */
+export const CHALLENGE_GATE_MS = 60_000;
+
 export function isMutedMessage(message) {
   return /user\s+is\s+muted|账号.{0,8}禁言|账户.{0,8}禁言/i.test(String(message || ''));
+}
+
+/** 上游业务码 40303 / 文案 CHALLENGE_REQUIRED：需要人工完成挑战，不是可重试的普通错误。 */
+export function isChallengeRequired(code, message) {
+  if (Number(code) === 40303) return true;
+  return /CHALLENGE_REQUIRED/i.test(String(message || ''));
 }
 
 /**
@@ -51,6 +73,8 @@ export function isMutedMessage(message) {
  * 限流、登录态失效、上游报错则先停用当前号再试下一个。
  */
 export function isAccountScopedFailure(err) {
+  // 人机挑战是会话/网络级风控，换号也没用，而且不能因此停用账号。
+  if (err instanceof ChallengeRequiredError) return false;
   if (err instanceof RateLimitError || err instanceof AuthExpiredError) return true;
   if (err instanceof UpstreamError) {
     return !(err.status === 499 || err.code === 'client_closed');
@@ -115,6 +139,8 @@ export class DirectEngine {
       toolMinGapMs: config.runtime.toolMinGapMs,
     });
     this.fileCache = new Map();
+    // 挑战闸门：key = 会话 id / 请求指纹，value = 解禁时间戳
+    this.challengeGate = new Map();
     this.inflight = 0;
     this.closed = false;
     this.coldStarted = false;
@@ -383,6 +409,32 @@ export class DirectEngine {
     }
   }
 
+  /** 挑战闸门的 key：优先会话 id；新会话拿不到 id 时用 prompt 哈希，保证同一请求重发命中同一个 key。 */
+  #challengeKey(session, prompt) {
+    return session?.chatSessionId || session?.conversationId || hashPrefix(prompt);
+  }
+
+  #assertChallengeGate(key) {
+    const until = this.challengeGate.get(key);
+    if (!until) return;
+    const left = until - Date.now();
+    if (left > 0) {
+      throw new ChallengeRequiredError(
+        `同一会话的上游挑战尚未解除（剩余 ${Math.ceil(left / 1000)}s），本次不再发起上游尝试。请先运行：npm run recover:challenge`,
+        { retryAfterMs: left },
+      );
+    }
+    this.challengeGate.delete(key);
+  }
+
+  #armChallengeGate(key) {
+    this.challengeGate.set(key, Date.now() + CHALLENGE_GATE_MS);
+    if (this.challengeGate.size > 200) {
+      const now = Date.now();
+      for (const [k, until] of this.challengeGate) if (until <= now) this.challengeGate.delete(k);
+    }
+  }
+
   async #run({
     account,
     prompt,
@@ -399,6 +451,9 @@ export class DirectEngine {
     // powHeader 必须是 let：40301 重试时要把它置空，逼下一轮重新 fetch+solve，
     // 否则会一直拿同一个失效 header 重试（历史 bug：日志里连续 3 次 INVALID_POW_RESPONSE）。
     let powHeader;
+
+    const challengeKey = this.#challengeKey(session, prompt);
+    this.#assertChallengeGate(challengeKey);
 
     /* --- 会话：能复用就复用；否则只建这一次（不再预建下一个会话） --- */
     let chatSessionId = session?.chatSessionId || null;
@@ -529,6 +584,15 @@ export class DirectEngine {
           const code = body?.code ?? body?.data?.biz_code;
           const message = body?.msg || body?.data?.biz_msg || `HTTP ${res.status}`;
 
+          // 40303 / CHALLENGE_REQUIRED：需要人工完成挑战，立即停止，不走任何重试。
+          // 先于 PoW/限流/会话重建判断，避免被误判成可重试错误后放大成多条上游请求。
+          if (isChallengeRequired(code, message)) {
+            this.#armChallengeGate(challengeKey);
+            throw new ChallengeRequiredError(
+              `DeepSeek 要求完成人机挑战（${message}）；网关已停止自动重试`,
+            );
+          }
+
           if ((code === 40301 || /POW/i.test(message)) && !powRetried) {
             // PoW 一次性 / 有过期时间：失败后必须换一个新的，不能复用旧 header。
             powRetried = true;
@@ -606,6 +670,12 @@ export class DirectEngine {
           // 限流 / 风控提示走 event: hint
           if (event === 'hint' && payload && payload.type === 'error') {
             const message = String(payload.content || '网页接口提示错误');
+            if (isChallengeRequired(payload.code, message)) {
+              this.#armChallengeGate(challengeKey);
+              throw new ChallengeRequiredError(
+                `DeepSeek 要求完成人机挑战（${message}）；网关已停止自动重试`,
+              );
+            }
             if (payload.finish_reason === 'rate_limit_reached' || /频繁|休息/.test(message)) {
               throw new RateLimitError(message);
             }

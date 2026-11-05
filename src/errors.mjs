@@ -5,6 +5,18 @@ export const AUTH_NEXT_ACTION = Object.freeze({
   doc: '使用手册 §6',
 });
 
+/**
+ * 上游要求人机挑战（业务码 40303 / CHALLENGE_REQUIRED）时给客户端的可执行动作。
+ *
+ * 注意：这个命令只复用「已登录的同一个浏览器实例」，不会新开第二个实例。
+ */
+export const CHALLENGE_NEXT_ACTION = Object.freeze({
+  action: 'complete-challenge',
+  command: 'npm run recover:challenge',
+  doc: '使用手册 §6.1',
+  note: '在已登录的同一个浏览器实例里完成人机挑战；网关不会自动新开浏览器',
+});
+
 const AUTH_GUIDANCE = '请重新登录：npm run auth:hybrid';
 
 function authGuidanceOf(err) {
@@ -28,7 +40,7 @@ export class ApiError extends Error {
   }
 
   toJSON() {
-    const nextAction = authGuidanceOf(this);
+    const nextAction = this.nextAction || authGuidanceOf(this);
     return {
       error: {
         message: authMessage(this, this.message),
@@ -36,6 +48,8 @@ export class ApiError extends Error {
         param: this.param,
         code: this.code,
         ...(nextAction ? { nextAction } : {}),
+        // 显式 false，避免客户端把「需要人工挑战」当成可重试的上游 5xx。
+        ...(this.retryable === false ? { retryable: false } : {}),
       },
     };
   }
@@ -69,6 +83,30 @@ export class CaptchaError extends UpstreamError {
   constructor(message = 'DeepSeek 弹出了人机验证 / 验证码，自动化无法继续。请换网络或稍后重试') {
     super(message, { status: 503, code: 'deepseek_captcha' });
     this.name = 'CaptchaError';
+  }
+}
+
+/**
+ * 上游要求完成人机挑战：`{ status: 200, code: 40303, msg: 'CHALLENGE_REQUIRED' }`。
+ *
+ * 为什么是 429 而不是 503：
+ * - 503 是典型「可重试 5xx」，上一轮真实测试里网关把 40303 包成 502，
+ *   客户端因此连续重试，把 1 次失败放大成 22 条补全请求；
+ * - 429 是 4xx 语义，且是唯一能合法携带标准 `Retry-After` 的状态码，
+ *   配合 `code=challenge_required` / `retryable=false` / `nextAction`，
+ *   让客户端「停下来等人」，而不是继续打上游。
+ * - 网关侧还会对同一会话做 60s 硬闸，即使客户端仍重试也不会再触达上游。
+ */
+export class ChallengeRequiredError extends UpstreamError {
+  constructor(
+    message = 'DeepSeek 要求完成人机挑战（CHALLENGE_REQUIRED/40303），自动化已停止。请运行 `npm run recover:challenge` 在已登录浏览器完成挑战后重试',
+    { retryAfterMs = 60_000 } = {},
+  ) {
+    super(message, { status: 429, code: 'challenge_required' });
+    this.name = 'ChallengeRequiredError';
+    this.retryAfterMs = retryAfterMs;
+    this.retryable = false;
+    this.nextAction = CHALLENGE_NEXT_ACTION;
   }
 }
 

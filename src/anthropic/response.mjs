@@ -88,8 +88,15 @@ export function anthropicErrorPayload(err) {
   const message = isAuth && !String(err?.message || '').includes('auth:hybrid')
     ? `${err?.message || '登录态失效'}。请重新登录：npm run auth:hybrid（使用手册 §6）`
     : err?.message || 'internal error';
+  const nextAction = err?.nextAction || (isAuth ? AUTH_NEXT_ACTION : null);
   return {
     type: 'error',
-    error: { type, message, ...(isAuth ? { nextAction: AUTH_NEXT_ACTION } : {}) },
+    error: {
+      type,
+      message,
+      ...(nextAction ? { nextAction } : {}),
+      // 与 OpenAI 侧一致：需要人工挑战时明确不可重试，避免客户端把 429 当成普通限流反复打。
+      ...(err?.retryable === false ? { retryable: false } : {}),
+    },
   };
 }

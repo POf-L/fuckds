@@ -834,6 +834,23 @@ browser 引擎单轮 2.2–2.9s（浏览器导航 + DOM 轮询）；直连引擎
 
 实测这个窗口大概一分钟：连续 3~4 条消息后会被挡，静置一分钟左右恢复。这是账号级预算，服务端没法绕开；工具轮次多的场景建议放慢节奏，或改用官方 API。
 
+**上游要求人机挑战（40303 / CHALLENGE_REQUIRED）**
+上游返回 HTTP 200 + `{ code: 40303, msg: 'CHALLENGE_REQUIRED' }` 时，网关会**立刻停止**，不再走通用重试：
+
+- 返回 `429` + `Retry-After: 60` + `x-should-retry: false`，错误体 `code=challenge_required`、`retryable:false`、`nextAction.command="npm run recover:challenge"`；
+- 同一会话 / 同一请求指纹在 60s 内只允许 1 次上游尝试，客户端即便重试也不会再触达上游；
+- 选择 429 而不是 503：503 属于可重试的 5xx（之前正是 502 被客户端放大成多条补全），429 是 4xx 语义且能合法携带 `Retry-After`。
+
+恢复办法（需要人工，脚本不会自己开第二个浏览器）：
+
+```bash
+npm run recover:challenge   # 复用已存在的 profile 浏览器实例，打开对话页等待你完成挑战
+```
+
+脚本只在 `profile-lock` 检测到活实例时通过 CDP 复用；没有活实例会提示先 `npm run auth:hybrid` 并退出。
+挑战消失且 `userToken` + hif 缓存就绪后，自动写入 `data/protocol-credentials.json` 与 `data/protocol-accounts/account-<指纹>.json`（0600），只打印哈希前缀。
+默认最多等 10 分钟（`RECOVER_TIMEOUT_MS` 可调）；超时会打印当前状态并以退出码 1 结束。
+
 **图片输入有什么限制**
 只支持直连引擎（`ENGINE=direct`）；browser 引擎会返回 400。单张 ≤10MB、一条请求最多 8 张。同一张图会按内容 hash 缓存 file id 30 分钟，重复问不会重复上传。
 
