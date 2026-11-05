@@ -106,6 +106,7 @@ export class ProtocolEngine {
         queued: scheduled.queued ?? 0,
         cooldownMs: scheduled.cooldownMs ?? 0,
         lastStartAt: scheduled.lastStartAt ?? null,
+        minGapMs: scheduled.minGapMs ?? 0,
         credentials: {
           ...credentialSummary(account.creds),
           hasToken: cred.hasToken,
@@ -117,6 +118,17 @@ export class ProtocolEngine {
     const dispatchableCount = perAccount.filter((a) => a.dispatchable).length;
     return {
       engine: 'protocol',
+      // 运行策略快照（只读，用来核对“默认参数已生效”；不含任何凭据值）
+      policy: {
+        minGapMs: this.config.runtime?.accountMinGapMs ?? null,
+        mutedCooldownMs: this.config.runtime?.mutedCooldownMs ?? null,
+        accountCooldownMs: this.config.runtime?.accountCooldownMs ?? null,
+        concurrency: this.config.runtime?.concurrency ?? null,
+        sessionReuse: this.config.runtime?.sessionReuse ?? null,
+        allowBrowserRefresh: this.config.protocol?.allowBrowserRefresh ?? null,
+        refreshOnAuthFail: this.config.protocol?.refreshOnAuthFail ?? null,
+        fallbackToHybrid: this.config.protocol?.fallbackToHybrid ?? null,
+      },
       layer: this.layer,
       degradations: this.degradations,
       lastReason: this.lastReason,
