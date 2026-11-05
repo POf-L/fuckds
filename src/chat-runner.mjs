@@ -179,7 +179,7 @@ export function createChatRunner({ config, log, web, sessions = null }) {
     const imageIds = [];
     if (request.images?.length) {
       const loaded = await Promise.all(request.images.map((image) => loadImage(image.url)));
-      imageIds.push(...(await web.uploadImages(loaded)));
+      imageIds.push(...(await web.uploadImages(loaded, { accountFingerprint: accountHint })));
       log?.info?.('已上传图片', { count: imageIds.length });
     }
 

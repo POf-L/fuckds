@@ -166,6 +166,23 @@ export class ProtocolEngine {
   }
 
   /**
+   * 图片上传：与文本附件走同一个 `/api/v0/file/upload_file`，
+   * 上传成功后同样把返回的 id 放进 `ref_file_ids`（bundle 中 completion 的
+   * `ref_file_ids` 对文件/图片是同一个字段，响应里的 `is_image` 只用于前端渲染）。
+   */
+  async uploadImages(images = [], options = {}) {
+    if (!images.length) return [];
+    await this.ensureStarted();
+    const selected = this.#selectAccount(options.accountFingerprint ?? null);
+    const engine = selected?.engine || this.inner;
+    if (!engine) throw new Error('协议通道没有可用账号');
+    if (typeof engine.uploadImages !== 'function') {
+      throw new Error('当前协议账号的引擎不支持图片上传');
+    }
+    return engine.uploadImages(images);
+  }
+
+  /**
    * 附件上传：委托给所选账号的 DirectEngine（每个账号自带独立调度队列）。
    * 传入 accountFingerprint 可保持「上传与补全落在同一账号」，避免 ref_file_id 跨号失效。
    * 未传时按负载选号（与 planAccount 相同的只读选择逻辑）。
