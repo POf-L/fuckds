@@ -188,7 +188,7 @@ export function createChatRunner({ config, log, web, sessions = null }) {
       if (typeof web.uploadAttachments !== 'function') {
         throw new PromptTooLongError('当前引擎不支持附件上传，无法承载超长上下文');
       }
-      const ids = await web.uploadAttachments([attachmentPlan.attachment]);
+      const ids = await web.uploadAttachments([attachmentPlan.attachment], { accountFingerprint: accountHint });
       log?.info?.('上下文超长，较早内容已转为附件', {
         name: attachmentPlan.attachment.name,
         chars: attachmentPlan.attachment.chars,
@@ -366,6 +366,8 @@ export function createChatRunner({ config, log, web, sessions = null }) {
         thinking: request.thinking,
         search: request.search,
         refFileIds: ids,
+        // 工具轮标记：引擎据此使用更保守的账号间隔（ACCOUNT_TOOL_MIN_GAP_MS）
+        tools: request.tools,
         signal,
         meta,
         session: sessionArgs

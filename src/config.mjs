@@ -265,6 +265,10 @@ export function loadConfig(env = process.env) {
       // 触发 429。默认 8000 把稳态压到 ≤7.5 条/分钟，约为失败阈值的 1/2；
       // 设 0 可关闭（不建议）。
       accountMinGapMs: int(env.ACCOUNT_MIN_GAP_MS, 8_000),
+      // 工具长任务（本次请求带 tools）的单账号最小间隔，独立于普通对话。
+      // 8s 节拍下工具轮峰值实测 6 条/分钟；15s 把理论上限压到 4 条/分钟，
+      // 与实测 429 阈值（11 条/分钟）留出约 2.75 倍余量。普通对话仍用 accountMinGapMs。
+      toolMinGapMs: int(env.ACCOUNT_TOOL_MIN_GAP_MS, 15_000),
       // 首段正文最多等多久思考内容（毫秒），保证 reasoning 一定排在 content 前面
       reasoningHoldMs: int(env.REASONING_HOLD_MS, 900),
       rateLimitBackoffMs: int(env.RATE_LIMIT_BACKOFF_MS, 4000),

@@ -6,6 +6,8 @@ import path from 'node:path';
 
 import { AccountPool } from '../src/direct/account-pool.mjs';
 import { AccountScheduler } from '../src/direct/scheduler.mjs';
+import { DirectEngine } from '../src/direct/client.mjs';
+import { loadConfig } from '../src/config.mjs';
 import { WebSessionStore } from '../src/session/store.mjs';
 import { ProtocolEngine } from '../src/protocol/client.mjs';
 
@@ -137,6 +139,62 @@ function fakeAccount(fingerprint, info, calls) {
     },
   };
 }
+
+test('调度：工具轮按 toolMinGapMs 排队（独立于普通对话间隔）', async () => {
+  const dir = tmpDir('sched-tool-gap');
+  try {
+    const pool = new AccountPool({ tokens: ['token-a'], dataDir: dir, logger: fakeLogger() });
+    const scheduler = new AccountScheduler({ pool, logger: fakeLogger(), minGapMs: 50, toolMinGapMs: 300 });
+    const rec = recorder();
+    const account = pool.accounts[0];
+
+    await Promise.all([
+      scheduler.run(account, rec.task('T1')),
+      // 工具轮：显式使用专用间隔（达到默认 15000 的同等语义，只是数值缩小以便快速测试）
+      scheduler.run(account, rec.task('T2'), { minGapMs: scheduler.toolMinGapMs }),
+    ]);
+
+    const spans = rec.overlaps().spans.sort((a, b) => a.start - b.start);
+    const gap = spans[1].start - spans[0].start;
+    assert.ok(gap >= 300, `工具轮未按 toolMinGapMs 排队：${gap}ms < 300ms`);
+    assert.equal(scheduler.stats()[0].toolMinGapMs, 300, 'stats 未暴露 toolMinGapMs');
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('默认配置：ACCOUNT_TOOL_MIN_GAP_MS=15000，且工具轮实际使用该值', async () => {
+  const dir = tmpDir('cfg-tool-gap');
+  try {
+    const config = loadConfig({ DATA_DIR: dir });
+    assert.equal(config.runtime.accountMinGapMs, 8000, '普通对话默认间隔应保持 8000');
+    assert.equal(config.runtime.toolMinGapMs, 15000, '工具轮默认间隔应为 15000');
+    assert.equal(
+      loadConfig({ DATA_DIR: dir, ACCOUNT_TOOL_MIN_GAP_MS: '2500' }).runtime.toolMinGapMs,
+      2500,
+      '环境变量应可覆盖工具轮间隔',
+    );
+
+    const engine = new DirectEngine({
+      config: {
+        ...config,
+        deepseek: { ...config.deepseek, token: 'token-a', tokens: ['token-a'], baseUrl: 'https://chat.deepseek.com' },
+      },
+      logger: fakeLogger(),
+    });
+    const seen = [];
+    // 只验证排队参数，不真的发请求
+    engine.scheduler.run = async (account, task, opts) => {
+      seen.push(opts?.minGapMs);
+      return { text: 'ok' };
+    };
+    await engine.chat({ prompt: '带工具', tools: [{ type: 'function', function: { name: 'read_file' } }] });
+    await engine.chat({ prompt: '普通对话' });
+    assert.deepEqual(seen, [15000, undefined], '工具轮应传 15000，普通对话不应覆盖默认值');
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
 
 test('协议多账号：新对话选负载最低的可用账号，绑定的对话钉住原账号', () => {
   const dir = tmpDir('proto-route');

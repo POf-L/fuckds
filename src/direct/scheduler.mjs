@@ -13,10 +13,12 @@ import { sleep } from '../util.mjs';
  * 该调度器只做排队，不做风控伪装：不伪造指纹、不并发探测。
  */
 export class AccountScheduler {
-  constructor({ pool, logger, minGapMs = 0 }) {
+  constructor({ pool, logger, minGapMs = 0, toolMinGapMs = 0 }) {
     this.pool = pool;
     this.log = logger;
     this.minGapMs = Math.max(0, Number(minGapMs) || 0);
+    // 工具长任务（请求带 tools）单独的最小间隔；0 表示不额外收紧
+    this.toolMinGapMs = Math.max(0, Number(toolMinGapMs) || 0);
     /** fingerprint → { account, inflight, queued, lastStartAt, tail } */
     this.states = new Map();
     for (const account of pool.accounts) this.#state(account);
@@ -47,6 +49,7 @@ export class AccountScheduler {
       available: (state.account.cooldownUntil || 0) <= now,
       lastStartAt: state.lastStartAt || null,
       minGapMs: this.minGapMs,
+      toolMinGapMs: this.toolMinGapMs,
     }));
   }
 
@@ -54,7 +57,7 @@ export class AccountScheduler {
    * 把一次「上游请求单元」排进该账号的 FIFO 队列。
    * 返回 task 的结果；task 抛错也不影响后续排队（链条照样往下走）。
    */
-  run(account, task, { signal } = {}) {
+  run(account, task, { signal, minGapMs } = {}) {
     const state = this.#state(account);
     const previous = state.tail;
     let release;
@@ -73,7 +76,9 @@ export class AccountScheduler {
           accountHash: state.account.fingerprint.slice(0, 12),
         });
       }
-      const wait = state.lastStartAt + this.minGapMs - Date.now();
+      // 调用方可按轮次覆盖（工具长任务用更大的间隔）；未传时用账号默认值
+      const gap = minGapMs === undefined ? this.minGapMs : Math.max(0, Number(minGapMs) || 0);
+      const wait = state.lastStartAt + gap - Date.now();
       if (wait > 0) await sleep(wait, signal);
       state.lastStartAt = Date.now();
       state.inflight += 1;

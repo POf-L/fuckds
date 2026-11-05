@@ -111,6 +111,8 @@ export class DirectEngine {
       pool: this.pool,
       logger,
       minGapMs: config.runtime.accountMinGapMs,
+      // 工具轮独立间隔：本次请求带 tools 时排队用这个值（默认 15000ms）
+      toolMinGapMs: config.runtime.toolMinGapMs,
     });
     this.fileCache = new Map();
     this.inflight = 0;
@@ -265,6 +267,8 @@ export class DirectEngine {
     thinking = false,
     search = false,
     refFileIds = [],
+    // 工具轮标记：由 chat-runner 透传本次请求的 tools；带 tools 时排队用 toolMinGapMs
+    tools = [],
     signal,
     onDelta,
     onThinking,
@@ -305,13 +309,18 @@ export class DirectEngine {
         }
 
         try {
-          // 账号级 FIFO + 单飞：同一个账号上的上游请求绝不重叠，不同账号并行
+          // 工具轮（带 tools）与长上下文轮（带 ref_file_ids）都按更保守的工具轮间隔排队
+          const toolRound = (Array.isArray(tools) && tools.length > 0)
+            || (Array.isArray(refFileIds) && refFileIds.length > 0);
           const result = await this.scheduler.run(
             account,
             () => this.#run({
               account, prompt, thinking, search, refFileIds, signal, onDelta, onThinking, startedAt, meta, session,
             }),
-            { signal },
+            {
+              signal,
+              minGapMs: toolRound ? this.scheduler.toolMinGapMs : undefined,
+            },
           );
           this.pool.markHealthy(account);
           return result;
@@ -756,8 +765,11 @@ export class DirectEngine {
   }
 
   async #uploadFile(account, file) {
-    // 上传也是打同一个账号的上游：必须进同一队列，不能和补全请求重叠
-    return this.scheduler.run(account, () => this.#uploadFileNow(account, file));
+    // 上传也是打同一个账号的上游：必须进同一队列，不能和补全请求重叠。
+    // 附件属于长任务链路，按工具轮间隔排队（普通对话的图片上传同样更保守，无害）。
+    return this.scheduler.run(account, () => this.#uploadFileNow(account, file), {
+      minGapMs: this.scheduler.toolMinGapMs,
+    });
   }
 
   async #uploadFileNow(account, file) {

@@ -121,6 +121,8 @@ export class ProtocolEngine {
       // 运行策略快照（只读，用来核对“默认参数已生效”；不含任何凭据值）
       policy: {
         minGapMs: this.config.runtime?.accountMinGapMs ?? null,
+        // 工具长任务专用间隔（默认 15000ms；普通对话仍用 minGapMs）
+        toolMinGapMs: this.config.runtime?.toolMinGapMs ?? null,
         mutedCooldownMs: this.config.runtime?.mutedCooldownMs ?? null,
         accountCooldownMs: this.config.runtime?.accountCooldownMs ?? null,
         concurrency: this.config.runtime?.concurrency ?? null,
@@ -161,6 +163,23 @@ export class ProtocolEngine {
     if (!selected) return null;
     const described = selected.engine.describeAccount?.() ?? {};
     return { ...described, fingerprint: selected.fingerprint };
+  }
+
+  /**
+   * 附件上传：委托给所选账号的 DirectEngine（每个账号自带独立调度队列）。
+   * 传入 accountFingerprint 可保持「上传与补全落在同一账号」，避免 ref_file_id 跨号失效。
+   * 未传时按负载选号（与 planAccount 相同的只读选择逻辑）。
+   */
+  async uploadAttachments(files = [], options = {}) {
+    if (!files.length) return [];
+    await this.ensureStarted();
+    const selected = this.#selectAccount(options.accountFingerprint ?? null);
+    const engine = selected?.engine || this.inner;
+    if (!engine) throw new Error('协议通道没有可用账号');
+    if (typeof engine.uploadAttachments !== 'function') {
+      throw new Error('当前协议账号的引擎不支持附件上传');
+    }
+    return engine.uploadAttachments(files);
   }
 
   async close() {
@@ -352,7 +371,6 @@ export class ProtocolEngine {
 
   async chat(args) {
     if (this.layer === 'hybrid' && this.hybrid) return this.hybrid.chat(args);
-
     let refreshed = false;
     for (;;) {
       try {
