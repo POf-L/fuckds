@@ -7,7 +7,7 @@ import path from 'node:path';
 import { AccountPool } from '../src/direct/account-pool.mjs';
 import { ProtocolEngine } from '../src/protocol/client.mjs';
 import { credentialSummary } from '../src/protocol/credentials.mjs';
-import { evaluateCredentialState } from '../src/auth/credential-state.mjs';
+import { evaluateCredentialState, isDispatchableState } from '../src/auth/credential-state.mjs';
 
 const TOKEN64 = 'a'.repeat(64);
 const HOUR = 60 * 60 * 1000;
@@ -53,7 +53,7 @@ test('evaluateCredentialState：缺 hif 登录标记判 anonymous', () => {
   assert.equal(state.reason, 'no-login-marker');
 });
 
-test('evaluateCredentialState：401 之后判 invalid；年龄超硬阈值也 invalid；超软阈值 stale', () => {
+test('evaluateCredentialState：401 判 invalid；年龄超硬阈值只告警（stale + ageWarn，可派发）', () => {
   const failed = evaluateCredentialState({
     token: TOKEN64,
     hasLoginMarker: true,
@@ -64,12 +64,22 @@ test('evaluateCredentialState：401 之后判 invalid；年龄超硬阈值也 in
   assert.equal(failed.reason, 'auth-failed');
   assert.equal(failed.lastAuthError.code, 'INVALID_TOKEN');
 
+  // 年龄超硬阈值：不再 invalid，而是可派发的 stale + 告警位
   const tooOld = evaluateCredentialState({ token: TOKEN64, hasLoginMarker: true, harvestedAt: Date.now() - 9 * HOUR });
-  assert.equal(tooOld.credentialState, 'invalid');
+  assert.equal(tooOld.credentialState, 'stale');
   assert.equal(tooOld.reason, 'age-exceeded');
+  assert.equal(tooOld.ageWarn, true);
+  assert.equal(isDispatchableState(tooOld.credentialState), true);
 
   const stale = evaluateCredentialState({ token: TOKEN64, hasLoginMarker: true, harvestedAt: Date.now() - 7 * HOUR });
   assert.equal(stale.credentialState, 'stale');
+  assert.equal(stale.reason, 'age-stale');
+  assert.equal(stale.ageWarn, false);
+
+  // 未超软阈值：valid 且无告警
+  const fresh = evaluateCredentialState({ token: TOKEN64, hasLoginMarker: true, harvestedAt: Date.now() - HOUR });
+  assert.equal(fresh.credentialState, 'valid');
+  assert.equal(fresh.ageWarn, false);
 });
 
 test('AccountPool：401 后状态变为 invalid，available/dispatchable=false 且不能选号', () => {
@@ -94,7 +104,7 @@ test('credentialSummary：匿名 token 不再报 hasToken=true', () => {
   assert.equal(JSON.stringify(real).includes(TOKEN64), false);
 });
 
-test('ProtocolEngine.status：年龄超阈值 → invalid + nextAction=re-login；匿名 → anonymous', () => {
+test('ProtocolEngine.status：年龄超阈值 → stale + dispatchable=true + ageWarn；匿名仍拒绝', () => {
   const engine = new ProtocolEngine({
     config: { protocol: { tokenMaxAgeMs: 8 * HOUR, tokenStaleAgeMs: 6 * HOUR }, deepseek: {} },
     logger: fakeLogger(),
@@ -106,12 +116,21 @@ test('ProtocolEngine.status：年龄超阈值 → invalid + nextAction=re-login�
     { creds: { userToken: 'd'.repeat(30), harvestedAt: Date.now() - 1000, hifLeim: null, hifDliq: null }, fingerprint: 'e'.repeat(16), engine: fakeInner },
   ];
   const st = engine.status();
-  assert.equal(st.accounts[0].credentialState, 'invalid');
-  assert.equal(st.accounts[0].dispatchable, false);
-  assert.equal(st.accounts[0].available, false);
+  // 9h 老 token：仍可派发，只打告警
+  assert.equal(st.accounts[0].credentialState, 'stale');
+  assert.equal(st.accounts[0].dispatchable, true);
+  assert.equal(st.accounts[0].available, true);
+  assert.equal(st.accounts[0].credentialAgeWarn, true);
+  assert.equal(st.accounts[0].lastRefreshAt, null);
+  assert.equal(st.accounts[0].lastRefreshResult, null);
   assert.equal(st.accounts[0].credentials.hasToken, true);
+  // 匿名 token 仍拒绝
   assert.equal(st.accounts[1].credentialState, 'anonymous');
   assert.equal(st.accounts[1].hasToken, false);
-  assert.equal(st.credentialState, 'invalid');
-  assert.equal(st.nextAction, 're-login');
+  assert.equal(st.accounts[1].dispatchable, false);
+  assert.equal(st.accounts[1].nextAction, 're-login');
+  // 顶层：有可派发账号 → 不是 re-login
+  assert.equal(st.credentialAgeWarn, true);
+  assert.equal(st.credentialState, 'stale');
+  assert.equal(st.nextAction, null);
 });

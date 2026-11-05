@@ -126,9 +126,12 @@ export function loadConfig(env = process.env) {
       ),
       // 多账号：目录下每个 *.json 是一份凭据（= 一个账号，一个独立 DirectEngine）
       accountsDir: path.resolve(ROOT, expandHome(str(env.PROTOCOL_ACCOUNTS_DIR, path.join(dataDir, 'protocol-accounts')))),
-      // 请求失败且证据指向凭据失效时，从 profile 刷新一次凭据再重试
-      // 默认关闭：自动重开浏览器复用用户 profile 会把已登录的会话弄丢（实测 2026-11-05）
-      refreshOnAuthFail: bool(env.PROTOCOL_REFRESH_ON_AUTH_FAIL, false),
+      // 请求失败且证据指向凭据失效时，尝试“静默刷新”一次再重试。
+      // 默认开启：只复用**已经存在的** profile 浏览器实例（connectOverCDP），绝不新开窗口；
+      // 没有活实例时直接返回 401 + nextAction，不会为了刷新拉起浏览器。
+      refreshOnAuthFail: bool(env.PROTOCOL_REFRESH_ON_AUTH_FAIL, true),
+      // 同一账号刷新节流：默认 60s 内最多刷新一次，避免刷新风暴
+      refreshMinIntervalMs: int(env.PROTOCOL_REFRESH_MIN_INTERVAL_MS, 60_000),
       // 刷新后仍失败，是否降级到 hybrid 全浏览器
       // 默认关闭：降级同样会拉起浏览器，失败时直接返回 401 + nextAction
       fallbackToHybrid: bool(env.PROTOCOL_FALLBACK_HYBRID, false),
@@ -137,9 +140,10 @@ export function loadConfig(env = process.env) {
       allowBrowserRefresh: bool(env.ALLOW_BROWSER_REFRESH, false),
       // 采集凭据时页面停留时间（给风控 SDK 写 hif 缓存的余量）
       harvestWaitMs: int(env.PROTOCOL_HARVEST_WAIT_MS, 2500),
-      // token 年龄硬阈值：超过即 credentialState=invalid（实测缓存 13.07h 必然 INVALID_TOKEN）
+      // token 年龄硬阈值：**仅告警**（credentialAgeWarn=true），不再拦截派发。
+      // 真实上游会话实测可活 ~13h，按 8h 一刀切会误杀可用凭据；是否失效以上游 401 为准。
       tokenMaxAgeMs: int(env.PROTOCOL_TOKEN_MAX_AGE_MS, 8 * 60 * 60 * 1000),
-      // token 年龄软阈值：超过标 stale，仍可派发但提示尽快更换
+      // token 年龄软阈值：超过标 stale（仍可派发，仅提示尽快更新）
       tokenStaleAgeMs: int(env.PROTOCOL_TOKEN_STALE_AGE_MS, 6 * 60 * 60 * 1000),
     },
     // 轻量浏览器传输引擎（ENGINE=light）：网络请求由浏览器自己发出，

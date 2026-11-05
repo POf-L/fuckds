@@ -7,6 +7,7 @@ import { liveProfilePort } from '../browser/profile-lock.mjs';
 import { fingerprintOf } from '../direct/account-pool.mjs';
 import { HybridEngine } from '../hybrid/client.mjs';
 import { evaluateCredentialState, isDispatchableState } from '../auth/credential-state.mjs';
+import { decideRefresh } from '../auth/refresh-policy.mjs';
 import {
   buildProtocolExtras,
   credentialSummary,
@@ -63,6 +64,19 @@ export class ProtocolEngine {
     this.lastRefreshAt = null;
     this.lastHarvestMs = null;
     this.lastLiveSyncAt = 0;
+    /** 最近一次刷新尝试的结果：success / failed / throttled / rejected-no-live / null */
+    this.lastRefreshResult = null;
+    /** 刷新节流：账号指纹 → 最近一次尝试时间（同一账号 ≥ refreshMinIntervalMs 才允许再试） */
+    this.refreshAttempts = new Map();
+  }
+
+  /** 该账号最近一次刷新尝试时间（没试过返回 null） */
+  #lastRefreshAtOf(fingerprint) {
+    return this.refreshAttempts.get(fingerprint || 'default')?.at ?? null;
+  }
+
+  #lastRefreshResultOf(fingerprint) {
+    return this.refreshAttempts.get(fingerprint || 'default')?.result ?? null;
   }
 
   async ensureStarted() {
@@ -91,16 +105,27 @@ export class ProtocolEngine {
         staleAgeMs: this.config.protocol.tokenStaleAgeMs,
       });
       const cooling = (scheduled.cooldownMs ?? 0) > 0;
+      // 年龄超硬阈值不再拦截派发：只有真实认证失败 / 匿名 / 无 token 才不可派发
       const dispatchable = !cooling && isDispatchableState(cred.credentialState);
+      const nextAction = dispatchable
+        ? null
+        : cred.credentialState === 'invalid' || cred.credentialState === 'anonymous'
+          ? 're-login'
+          : 'wait-cooldown';
       return {
         accountHash: account.fingerprint.slice(0, 12),
         // available 保留旧字段名，含义改为“能真正派发”；dispatchable 同义，便于新旧监控兼容
         available: dispatchable,
         dispatchable,
+        nextAction,
         credentialState: cred.credentialState,
         credentialReason: cred.reason,
         lastAuthError: cred.lastAuthError,
         credentialAgeMs: cred.ageMs,
+        // 仅告警：年龄已超硬阈值，但凭据仍可派发（真失效以上游 401 为准）
+        credentialAgeWarn: cred.ageWarn === true,
+        lastRefreshAt: this.#lastRefreshAtOf(account.fingerprint),
+        lastRefreshResult: this.#lastRefreshResultOf(account.fingerprint),
         hasToken: cred.hasToken,
         inflight: scheduled.inflight ?? 0,
         queued: scheduled.queued ?? 0,
@@ -129,6 +154,7 @@ export class ProtocolEngine {
         sessionReuse: this.config.runtime?.sessionReuse ?? null,
         allowBrowserRefresh: this.config.protocol?.allowBrowserRefresh ?? null,
         refreshOnAuthFail: this.config.protocol?.refreshOnAuthFail ?? null,
+        refreshMinIntervalMs: this.config.protocol?.refreshMinIntervalMs ?? null,
         fallbackToHybrid: this.config.protocol?.fallbackToHybrid ?? null,
       },
       layer: this.layer,
@@ -136,11 +162,15 @@ export class ProtocolEngine {
       lastReason: this.lastReason,
       credentialSource: this.credentialSource,
       lastRefreshAt: this.lastRefreshAt,
+      // 最近一次刷新结果（success / failed / throttled / rejected-no-live / null）
+      lastRefreshResult: this.lastRefreshResult,
       lastHarvestMs: this.lastHarvestMs,
       // 多账号：每个账号独立的 in-flight / 队列长度 / 冷却（只给哈希前缀）
       accounts: perAccount,
       accountsTotal: perAccount.length,
       credentialState: perAccount.length === 0 ? 'unknown' : dispatchableCount > 0 ? (states.includes('stale') ? 'stale' : 'valid') : states[0],
+      // 年龄超阈值只告警，不影响 dispatchable / nextAction
+      credentialAgeWarn: perAccount.some((account) => account.credentialAgeWarn === true),
       nextAction: dispatchableCount > 0 ? null : perAccount.length === 0 || states.some((s) => s === 'invalid' || s === 'anonymous') ? 're-login' : 'wait-cooldown',
       credentials: this.accounts[0] ? { ...credentialSummary(this.accounts[0].creds), hasToken: perAccount[0]?.hasToken ?? false, credentialState: perAccount[0]?.credentialState } : null,
       // 网页会话复用状态：只暴露布尔与哈希前缀，绝不输出原始会话 id
@@ -313,12 +343,27 @@ export class ProtocolEngine {
     if (loaded.length) {
       this.credentialSource = loaded.length > 1 ? `cache:${loaded.length}-accounts` : 'cache';
     } else {
-      this.#assertBrowserRefreshAllowed(force ? 'auth-refresh' : 'startup-harvest');
-      const creds = await harvestCredentials({ config: this.config, logger: this.log });
-      const file = this.#saveCredential(creds);
-      this.credentialSource = 'harvested';
-      this.lastHarvestMs = creds.harvestMs ?? null;
-      loaded = [{ creds, file }];
+      // 没有缓存凭据：先从“已经存在的” profile 实例读（复用，不新开窗口）。
+      const live = await this.#harvestLiveCredentials();
+      if (live) {
+        const file = this.#saveCredential(live);
+        this.credentialSource = 'live-profile';
+        this.lastHarvestMs = live.harvestMs ?? null;
+        loaded = [{ creds: live, file }];
+      } else if (this.config.protocol.allowBrowserRefresh === true) {
+        // 只有用户显式打开策略闸门，才允许为了首次采集启动浏览器
+        this.#assertBrowserRefreshAllowed(force ? 'auth-refresh' : 'startup-harvest');
+        const creds = await harvestCredentials({ config: this.config, logger: this.log });
+        const file = this.#saveCredential(creds);
+        this.credentialSource = 'harvested';
+        this.lastHarvestMs = creds.harvestMs ?? null;
+        loaded = [{ creds, file }];
+      } else {
+        // 没有活实例、也没有凭据：不自动开浏览器，直接按 401 让用户手动登录一次
+        throw new AuthExpiredError(
+          '还没有可用凭据：请手动运行 npm run auth:hybrid 登录一次（网关不会自动打开浏览器）',
+        );
+      }
     }
     this.#buildEngines(loaded);
   }
@@ -367,35 +412,112 @@ export class ProtocolEngine {
     }).account;
   }
 
-  async #refreshCredentials() {
-    // 第一优先：从“已经在运行的 profile 实例”重新读（不启动浏览器）。
-    // 只有没有活实例时，才需要用户显式授权打开浏览器（默认拒绝）。
-    const live = await this.#harvestLiveCredentials();
-    if (!live) this.#assertBrowserRefreshAllowed('auth-refresh');
+  /**
+   * 真实认证失败（401 / INVALID_TOKEN / user is muted）才改变可用性：
+   * 把该账号在号池里标记为 authFailed，/healthz 立即变成 dispatchable=false + nextAction=re-login。
+   * 刷新成功后会 markHealthy 清掉这个标记。
+   */
+  #markAuthFailed(fingerprint = null) {
+    const target = (fingerprint && this.accounts.find((account) => account.fingerprint === fingerprint))
+      || this.accounts[0];
+    const pool = target?.engine?.pool;
+    if (!pool?.accounts?.length) return;
+    for (const inner of pool.accounts) {
+      pool.markUnavailable(inner, 0, '登录态失效', { authFailed: true, authErrorCode: 'INVALID_TOKEN' });
+    }
+  }
+
+  /**
+   * 刷新凭据（静默、节流、不新开浏览器）：
+   *   - 有活 profile 实例 → 经 profile 锁 connectOverCDP 复用，读最新 cookie/hif；
+   *   - 没有活实例 → 拒绝（不启动浏览器），交给调用方按 401 + nextAction 返回；
+   *   - 同一账号 ≥ refreshMinIntervalMs（默认 60s）才允许再次刷新。
+   */
+  async #refreshCredentials(fingerprint = null) {
+    const key = fingerprint || 'default';
+    const profileDir = this.config.hybrid?.profileDir;
+    const livePort = profileDir ? await liveProfilePort(profileDir) : null;
+    const minIntervalMs = this.config.protocol.refreshMinIntervalMs ?? 60_000;
+    const decision = decideRefresh({
+      hasLiveInstance: Boolean(livePort),
+      allowBrowserRefresh: this.config.protocol.allowBrowserRefresh === true,
+      lastAttemptAt: this.#lastRefreshAtOf(key),
+      now: Date.now(),
+      minIntervalMs,
+    });
+
+    if (decision.action === 'throttled') {
+      this.lastRefreshResult = 'throttled';
+      const err = new Error(`刷新节流：同一账号 ${minIntervalMs}ms 内最多刷新一次（上次 ${Math.round(decision.sinceLastMs)}ms 前）`);
+      err.code = 'refresh_throttled';
+      this.log.warn?.('协议通道：刷新被节流', { sinceLastMs: decision.sinceLastMs, minIntervalMs });
+      throw err;
+    }
+
+    this.lastRefreshAt = Date.now();
+    if (decision.action === 'reject') {
+      this.refreshAttempts.set(key, { at: this.lastRefreshAt, result: 'rejected-no-live' });
+      this.lastRefreshResult = 'rejected-no-live';
+      const err = new Error(
+        '没有活的 profile 实例：按策略不自动开浏览器刷新凭据；请在已登录的窗口里重新登录，或手动运行 npm run auth:hybrid',
+      );
+      err.code = 'refresh_unavailable';
+      this.log.warn?.('协议通道：无活实例，不自动开浏览器', { reason: this.lastReason });
+      throw err;
+    }
+
     this.log.warn('协议通道：凭据疑似失效，从浏览器 profile 刷新一次', {
       reason: this.lastReason,
       source: this.credentialSource,
+      action: decision.action,
     });
+    this.refreshAttempts.set(key, { at: this.lastRefreshAt, result: 'failed' });
+
+    if (decision.action === 'live') {
+      const live = await this.#harvestLiveCredentials();
+      if (!live) {
+        this.lastRefreshResult = 'failed';
+        const err = new Error('从活的 profile 实例读取凭据失败');
+        err.code = 'refresh_failed';
+        throw err;
+      }
+      // 同一 token：原地更新 cookie/hif（引擎不重建）；token 变了：落盘并重建
+      this.#applyLiveCredentials(live);
+      // 刷新成功即清除上一次 401 留下的 authFailed 停用标记，否则重试会被号池直接拒掉
+      for (const account of this.accounts) {
+        const pool = account.engine?.pool;
+        if (!pool) continue;
+        for (const inner of pool.accounts ?? []) pool.markHealthy(inner);
+      }
+      this.refreshAttempts.set(key, { at: this.lastRefreshAt, result: 'success' });
+      this.lastRefreshResult = 'success';
+      this.degradations += 1;
+      return true;
+    }
+
+    // 仅当 ALLOW_BROWSER_REFRESH=true（用户显式授权）才启动浏览器
     const old = this.accounts.map((account) => account.engine);
     this.accounts = [];
     this.inner = null;
     for (const engine of old) await engine?.close?.().catch?.(() => {});
-    this.lastRefreshAt = Date.now();
-    if (live) this.#applyLiveCredentials(live);
-    else await this.#loadOrHarvest(true);
+    await this.#loadOrHarvest(true);
+    this.refreshAttempts.set(key, { at: this.lastRefreshAt, result: 'success' });
+    this.lastRefreshResult = 'success';
     this.degradations += 1;
+    return true;
   }
 
   async chat(args) {
     if (this.layer === 'hybrid' && this.hybrid) return this.hybrid.chat(args);
     let refreshed = false;
     for (;;) {
+      let selected = null;
       try {
         await this.ensureStarted();
         // 活 profile 优先：每 60s 从已运行的实例同步 cookie/hif（绝不为此新开浏览器）
         await this.#syncFromLiveProfile();
         const preferred = args.session?.accountFingerprint ?? args.accountFingerprint ?? null;
-        const selected = this.#selectAccount(preferred);
+        selected = this.#selectAccount(preferred);
         const engine = selected?.engine || this.inner;
         if (!engine) throw new Error('协议通道没有可用账号');
         // 钉住账号：把本次选中的账号指纹交给引擎，避免它在内部又换号
@@ -408,17 +530,24 @@ export class ProtocolEngine {
       } catch (err) {
         if (!looksLikeCredentialFailure(err)) throw err;
         this.lastReason = `${err.name || 'Error'}: ${err.message}`;
+        // 真实失败的账号指纹：优先会话钉住的号，否则用本次实际选中的号
+        const preferred = args.session?.accountFingerprint ?? args.accountFingerprint
+          ?? selected?.fingerprint ?? null;
+        // 上游真实拒绝（401/INVALID_TOKEN）才把账号判为失效；年龄超阈值不算
+        this.#markAuthFailed(preferred);
         if (!refreshed && this.config.protocol.refreshOnAuthFail !== false) {
           refreshed = true;
           try {
-            await this.#refreshCredentials();
+            // 静默刷新：只复用已有活实例；无活实例时直接抛错，不启动浏览器
+            await this.#refreshCredentials(preferred);
             continue;
           } catch (refreshErr) {
-            // 采集失败（profile 未登录 / 浏览器起不来）本身就是降级理由
             this.lastReason = `凭据刷新失败: ${refreshErr.message}`;
             this.log.warn?.('协议通道：凭据刷新失败', { reason: refreshErr.message, code: refreshErr.code });
-            // 策略拒绝：不再降级（降级同样要起浏览器），直接把可执行错误抛给客户端
-            if (refreshErr.code === 'refresh_blocked_by_policy') throw refreshErr;
+            // 刷新失败不重试、不降级：直接 401 + nextAction，客户端据此提示登录
+            throw err.name === 'AuthExpiredError'
+              ? err
+              : new AuthExpiredError(`协议凭据失效：${err.message}（刷新未成功：${refreshErr.message}）`);
           }
         }
         if (this.config.protocol.fallbackToHybrid === false) {

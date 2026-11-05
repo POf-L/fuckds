@@ -9,6 +9,7 @@ import {
   unwrapStorageValue,
 } from '../src/protocol/credentials.mjs';
 import { ProtocolEngine, looksLikeCredentialFailure } from '../src/protocol/client.mjs';
+import { fingerprintOf } from '../src/direct/account-pool.mjs';
 
 test('unwrapStorageValue：json 字符串 / {value} / 裸值', () => {
   assert.equal(unwrapStorageValue('"abc"'), 'abc');
@@ -104,7 +105,7 @@ test('ProtocolEngine：认证失败且关闭刷新/降级时不吞错', async ()
   assert.equal(engine.degradations, 0);
 });
 
-test('ProtocolEngine：ALLOW_BROWSER_REFRESH 未开启时刷新被策略拒绝且不降级', async () => {
+test('ProtocolEngine：无活实例时刷新被拒绝（不自动开浏览器）且不降级', async () => {
   const warns = [];
   const logger = {
     warn: (...args) => warns.push(args),
@@ -124,21 +125,83 @@ test('ProtocolEngine：ALLOW_BROWSER_REFRESH 未开启时刷新被策略拒绝�
   engine.inner = { chat: async () => { throw err; }, close: () => {} };
   await assert.rejects(
     engine.chat({ prompt: '你好' }),
-    (e) => e.code === 'refresh_blocked_by_policy' && /ALLOW_BROWSER_REFRESH=false/.test(e.message),
+    (e) => e.name === 'AuthExpiredError'
+      && e.status === 401
+      && /没有活的 profile 实例/.test(e.message)
+      && /刷新未成功/.test(e.message),
   );
   assert.equal(engine.layer, 'protocol');
   assert.equal(engine.degradations, 0);
   assert.equal(engine.hybrid, null);
-  assert.equal(warns.some(([msg]) => msg === 'refresh_blocked_by_policy'), true);
+  assert.equal(engine.lastRefreshResult, 'rejected-no-live');
+  assert.equal(warns.some(([msg]) => msg === '协议通道：凭据刷新失败'), true);
 });
 
-test('ProtocolEngine：无凭据时启动采集被策略拒绝（不自动开浏览器）', async () => {
+test('ProtocolEngine：真实 401 后账号变 invalid，/healthz dispatchable=false + nextAction=re-login', async () => {
+  const logger = { warn() {}, info() {}, child: () => ({ warn() {}, info() {}, debug() {} }) };
+  const config = {
+    protocol: {
+      credentialsFile: 'unused.json',
+      refreshOnAuthFail: true,
+      fallbackToHybrid: false,
+      allowBrowserRefresh: false,
+      refreshMinIntervalMs: 60_000,
+    },
+    deepseek: {},
+  };
+  const engine = new ProtocolEngine({ config, logger });
+  const token = 'A'.repeat(64);
+  const innerAccount = { index: 0, authFailed: false, lastAuthError: null };
+  const pool = {
+    accounts: [innerAccount],
+    markUnavailable(account, _ms, _reason, { authFailed, authErrorCode } = {}) {
+      if (authFailed) {
+        account.authFailed = true;
+        account.lastAuthError = { at: Date.now(), code: authErrorCode || 'auth_failed' };
+      }
+    },
+    markHealthy() {},
+  };
+  const account = {
+    creds: { userToken: token, hifLeim: 'x', harvestedAt: Date.now() },
+    file: 'unused.json',
+    fingerprint: fingerprintOf(token),
+    engine: {
+      chat: async () => {
+        throw Object.assign(new Error('创建会话失败：INVALID_TOKEN'), { status: 502, name: 'UpstreamError' });
+      },
+      status: () => ({
+        accounts: [innerAccount],
+        scheduler: [{ inflight: 0, queued: 0, cooldownMs: 0, lastStartAt: null, minGapMs: 8000 }],
+      }),
+      describeAccount: () => ({ available: true, cooldownMs: 0, load: 0 }),
+      pool,
+    },
+  };
+  engine.accounts = [account];
+
+  await assert.rejects(
+    engine.chat({ prompt: '你好' }),
+    (e) => e.name === 'AuthExpiredError' && e.status === 401,
+  );
+  const status = engine.status();
+  assert.equal(status.accounts[0].credentialState, 'invalid');
+  assert.equal(status.accounts[0].credentialReason, 'auth-failed');
+  assert.equal(status.accounts[0].dispatchable, false);
+  assert.equal(status.accounts[0].nextAction, 're-login');
+  assert.equal(status.credentialState, 'invalid');
+  assert.equal(status.nextAction, 're-login');
+  // 只能失败一次：刷新失败不重试
+  assert.equal(status.accounts[0].lastRefreshResult, 'rejected-no-live');
+});
+
+test('ProtocolEngine：无凭据时启动不自动开浏览器，直接按 401 提示登录', async () => {
   const logger = { warn() {}, child: () => ({ warn() {}, info() {}, debug() {} }) };
   const config = { protocol: { credentialsFile: 'unused.json', allowBrowserRefresh: false }, deepseek: {} };
   const engine = new ProtocolEngine({ config, logger });
   await assert.rejects(
     engine.ensureStarted(),
-    (e) => e.code === 'refresh_blocked_by_policy' && /startup-harvest/.test(e.message),
+    (e) => e.name === 'AuthExpiredError' && e.code === 'deepseek_auth_required' && /还没有可用凭据/.test(e.message),
   );
 });
 

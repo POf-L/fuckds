@@ -6,10 +6,15 @@
  *
  * 状态：
  *   valid      —— 结构正确、有登录标记、年龄未超软阈值、没有认证失败记录
- *   stale      —— 结构正确但年龄超过软阈值（默认 6h），仍可派发，只是该尽快换
- *   invalid    —— 没有 token / 认证失败 / 年龄超过硬阈值（默认 8h）
+ *   stale      —— 结构正确但年龄超过软阈值（默认 6h），仍可派发，只是该尽快换；
+ *                 超过硬阈值（默认 8h）也只是 stale + ageWarn=true，**不再拦截派发**
+ *   invalid    —— 没有 token / 真实认证失败（401/INVALID_TOKEN 等）
  *   anonymous  —— token 结构不像登录态（如 30 字符访客 token）或缺 hif 登录标记
  *   unknown    —— 无法判定（未提供判断所需的字段）
+ *
+ * 年龄阈值只作告警：真实上游会话通常能活 13h 左右，本地按 8h 一刀切会把还能用的
+ * 凭据判死，造成“每次都要手动登录”。可用性只由真实上游返回（401/INVALID_TOKEN/
+ * user is muted）与匿名 token 决定。
  */
 
 export const TOKEN_MAX_AGE_MS_DEFAULT = 8 * 60 * 60 * 1000;
@@ -35,7 +40,9 @@ export function evaluateCredentialState({
     ? { at: lastAuthError.at ?? null, code: lastAuthError.code ?? null }
     : null;
 
-  const base = { ageMs, lastAuthError: authError };
+  // 年龄只做告警位：超过硬阈值仍可派发，由真实上游决定是否失效。
+  const ageWarn = ageMs !== null && maxAgeMs > 0 && ageMs > maxAgeMs;
+  const base = { ageMs, lastAuthError: authError, ageWarn };
 
   if (!token) return { ...base, credentialState: 'invalid', hasToken: false, reason: 'no-token' };
   if (!looksLikeLoginToken(token)) {
@@ -45,11 +52,9 @@ export function evaluateCredentialState({
     return { ...base, credentialState: 'anonymous', hasToken: false, reason: 'no-login-marker' };
   }
   if (authFailed) return { ...base, credentialState: 'invalid', hasToken: true, reason: 'auth-failed' };
-  if (ageMs !== null && maxAgeMs > 0 && ageMs > maxAgeMs) {
-    return { ...base, credentialState: 'invalid', hasToken: true, reason: 'age-exceeded' };
-  }
   if (ageMs !== null && staleAgeMs > 0 && ageMs > staleAgeMs) {
-    return { ...base, credentialState: 'stale', hasToken: true, reason: 'age-stale' };
+    // 超硬阈值原因保留 age-exceeded，但状态是可派发的 stale
+    return { ...base, credentialState: 'stale', hasToken: true, reason: ageWarn ? 'age-exceeded' : 'age-stale' };
   }
   return { ...base, credentialState: 'valid', hasToken: true, reason: null };
 }
