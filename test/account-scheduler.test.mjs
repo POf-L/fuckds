@@ -163,6 +163,39 @@ test('调度：工具轮按 toolMinGapMs 排队（独立于普通对话间隔）
   }
 });
 
+test('调度：客户端在等最小间隔时取消，不得把该账号的 FIFO 永久堵死', async () => {
+  const dir = tmpDir('sched-abort');
+  try {
+    const pool = new AccountPool({ tokens: ['token-a'], dataDir: dir, logger: fakeLogger() });
+    const scheduler = new AccountScheduler({ pool, logger: fakeLogger(), minGapMs: 200 });
+    const account = pool.accounts[0];
+
+    const first = scheduler.run(account, async () => {
+      await sleep(100);
+      return 'A';
+    });
+    const controller = new AbortController();
+    // 第二条会先等第一条结束，再等 minGapMs（约 t+200ms）才放行；在 t+150ms 取消，
+    // 正好落在 sleep(wait, signal) 里 —— 这里曾因为 release() 不在最外层 finally 而永久堵死
+    const second = scheduler.run(account, async () => 'B', { signal: controller.signal });
+    await sleep(150);
+    controller.abort();
+    await assert.rejects(second, (err) => err.name === 'AbortError' || /abort/i.test(String(err.message)));
+    assert.equal(await first, 'A');
+
+    const third = await Promise.race([
+      scheduler.run(account, async () => 'C'),
+      sleep(1500).then(() => 'TIMEOUT'),
+    ]);
+    assert.equal(third, 'C', '取消后队列被堵死了：后续请求 1.5s 内没有执行');
+    const stats = scheduler.stats()[0];
+    assert.equal(stats.inflight, 0);
+    assert.equal(stats.queued, 0);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('默认配置：ACCOUNT_TOOL_MIN_GAP_MS=15000，且工具轮实际使用该值', async () => {
   const dir = tmpDir('cfg-tool-gap');
   try {

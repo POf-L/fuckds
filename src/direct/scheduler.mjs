@@ -76,16 +76,21 @@ export class AccountScheduler {
           accountHash: state.account.fingerprint.slice(0, 12),
         });
       }
-      // 调用方可按轮次覆盖（工具长任务用更大的间隔）；未传时用账号默认值
-      const gap = minGapMs === undefined ? this.minGapMs : Math.max(0, Number(minGapMs) || 0);
-      const wait = state.lastStartAt + gap - Date.now();
-      if (wait > 0) await sleep(wait, signal);
-      state.lastStartAt = Date.now();
-      state.inflight += 1;
       try {
-        return await task(account);
+        // 调用方可按轮次覆盖（工具长任务用更大的间隔）；未传时用账号默认值
+        const gap = minGapMs === undefined ? this.minGapMs : Math.max(0, Number(minGapMs) || 0);
+        const wait = state.lastStartAt + gap - Date.now();
+        // 注意：这里如果被 signal 取消会抛错，release() 必须在最外层 finally 里，
+        // 否则一次「取消/超时」就能把该账号的 FIFO 链条永久堵死（后续所有请求排队不执行）。
+        if (wait > 0) await sleep(wait, signal);
+        state.lastStartAt = Date.now();
+        state.inflight += 1;
+        try {
+          return await task(account);
+        } finally {
+          state.inflight -= 1;
+        }
       } finally {
-        state.inflight -= 1;
         release();
       }
     })();
