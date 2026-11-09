@@ -58,21 +58,52 @@ export function normalizeChatRequest(body, config) {
 
 const MAX_IMAGES = 8;
 
-/** 从 messages 里收集图片（只认 user 的 image_url 部分） */
+/**
+ * 收集「需要上传给网页版」的图片。
+ *
+ * 关键：只看**最后一条 user 消息**里的图片，不看整个历史。
+ *
+ * 为什么：prompt 拼接时历史图片本来就不进正文（contentToText 直接丢弃图片块，
+ * 只有文本进 prompt），所以历史图片传上去也没人看；
+ * 但之前这里扫描的是全部 messages，于是每多一轮对话，历史截图就被重新收集一遍、
+ * 重新上传一遍 —— 聊天轮次一多就超过 8 张，直接 400「一条请求最多 8 张图片」，
+ * 表现就是「明明一张图都没发，聊久了就报错」。
+ *
+ * 只取最后一条 user 消息，既符合「图片只在当轮有意义」的语义，
+ * 也避免了重复上传旧图带来的额外耗时。
+ */
 export function collectImages(messages = []) {
-  const images = [];
-  for (const message of messages) {
-    if (message?.role !== 'user' || !Array.isArray(message.content)) continue;
-    for (const part of message.content) {
-      if (!part || typeof part !== 'object') continue;
-      const type = part.type || (part.image_url ? 'image_url' : '');
-      if (!['image_url', 'input_image', 'image'].includes(type)) continue;
-      const url = part.image_url?.url ?? part.image_url ?? part.url ?? part.data;
-      if (typeof url === 'string' && url.trim()) images.push({ url: url.trim() });
+  const lastUserIndex = (() => {
+    for (let i = messages.length - 1; i >= 0; i -= 1) {
+      if (messages[i]?.role === 'user') return i;
     }
+    return -1;
+  })();
+  if (lastUserIndex < 0) return [];
+
+  const message = messages[lastUserIndex];
+  if (!Array.isArray(message.content)) return [];
+
+  const images = [];
+  for (const part of message.content) {
+    if (!part || typeof part !== 'object') continue;
+    const type = part.type || (part.image_url ? 'image_url' : '');
+    if (!['image_url', 'input_image', 'image'].includes(type)) continue;
+    const url = part.image_url?.url ?? part.image_url ?? part.url ?? part.data;
+    if (typeof url === 'string' && url.trim()) images.push({ url: url.trim() });
   }
+
   if (images.length > MAX_IMAGES) {
-    throw new ApiError(400, `一条请求最多 ${MAX_IMAGES} 张图片`, { code: 'too_many_images' });
+    const summary = images.map((image, i) => {
+      const url = String(image.url ?? '');
+      const kind = url.startsWith('data:') ? 'data-url' : url.startsWith('http') ? 'http-url' : 'raw';
+      return `#${i + 1} ${kind}(${url.length}字符)`;
+    });
+    throw new ApiError(
+      400,
+      `一条请求最多 ${MAX_IMAGES} 张图片（当前这条消息里识别到 ${images.length} 张：${summary.join(' | ')}）`,
+      { code: 'too_many_images' },
+    );
   }
   return images;
 }
