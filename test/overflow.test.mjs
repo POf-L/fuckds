@@ -67,7 +67,7 @@ test('超限：客户端 system 过大时移进附件，协议提示词和最新
   assert.match(text, /SYSSTART/);
 });
 
-test('超限：工具声明过大时也能移进附件', () => {
+test('超限：工具声明不再被挪进附件，放不下时明确报错', () => {
   const bigSchema = {
     type: 'function',
     function: {
@@ -81,14 +81,15 @@ test('超限：工具声明过大时也能移进附件', () => {
     tools: [bigSchema],
   });
 
-  const plan = planOverflow(prompt, { maxChars: 6000 });
-  const text = plan.attachment.buffer.toString('utf8');
-
-  assert.ok(plan.prompt.length <= 6000, `正文超限: ${plan.prompt.length}`);
-  assert.ok(plan.prompt.includes(SPECIAL_TOKENS_HEADER.trim()));
-  assert.match(plan.prompt, /## CONTEXT_ATTACHMENT:/);
-  assert.ok(!plan.prompt.includes('BIGTOOLS'), '工具声明应该进附件');
-  assert.match(text, /BIGTOOLS/);
+  // 以前这里会把工具声明拆进附件，导致模型在正文里看不到 schema、乱调工具。
+  // 现在的约定是：工具声明永不进附件，放不下就报错并提示改用压缩模式。
+  assert.throws(
+    () => planOverflow(prompt, { maxChars: 6000 }),
+    (err) => {
+      assert.ok(/TOOL_DECL_MODE=compact|工具声明/.test(err.message), err.message);
+      return true;
+    },
+  );
 });
 
 test('最后一段自己就超长：保留尾部，前面进附件', () => {
@@ -125,4 +126,69 @@ test('连协议提示词都放不下时报错', () => {
     messages: [{ role: 'user', content: 'x'.repeat(20_000) }],
   });
   assert.throws(() => planOverflow(prompt, { maxChars: 1500 }), /无法保留任何对话内容|超过上限/);
+});
+
+function manyTools(count, descChars) {
+  return Array.from({ length: count }, (_, i) => ({
+    type: 'function',
+    function: {
+      name: `tool_${i}`,
+      description: `工具 ${i} ${'说明'.repeat(descChars)}`,
+      parameters: {
+        type: 'object',
+        properties: { command: { type: 'string' }, cwd: { type: 'string' } },
+        required: ['command'],
+      },
+    },
+  }));
+}
+
+test('拆分：工具声明永远不会被挪进附件', () => {
+  // 工具声明很大但还没到「完全放不下」的程度：应当只挪对话，工具声明留在正文
+  const messages = [];
+  for (let i = 0; i < 8; i += 1) {
+    messages.push({ role: 'assistant', content: long(`第${i}步`, 6000) });
+    messages.push({ role: 'tool', content: long(`结果${i}`, 6000) });
+  }
+  messages.push({ role: 'user', content: '最后的问题' });
+
+  const tools = manyTools(40, 500); // 约 40 × 1.6KB
+  const built = buildPrompt({ messages, tools });
+  const plan = planOverflow(built.prompt, { maxChars: 100_000, maxAttachmentChars: 2_000_000 });
+
+  assert.ok(plan.attachment, '这一组应当触发拆分');
+  const movedKinds = plan.attachment.moved.map((block) => block.kind);
+  assert.ok(!movedKinds.includes('Tool_functions'), `工具声明不该出现在附件里，实际 ${JSON.stringify(movedKinds)}`);
+  assert.ok(plan.prompt.includes('## Tool_functions:'), '正文必须保留工具声明');
+  assert.ok(plan.attachment.buffer.toString('utf8').includes('## Assistant:'), '较早对话应进附件');
+});
+
+test('拆分：工具声明大到放不下时明确报错，而不是悄悄挪进附件', () => {
+  const messages = [{ role: 'user', content: '问题' }];
+  const tools = manyTools(100, 2000); // 约 100 × 4KB = 400KB
+  const built = buildPrompt({ messages, tools });
+
+  assert.throws(
+    () => planOverflow(built.prompt, { maxChars: 100_000, maxAttachmentChars: 2_000_000 }),
+    (err) => {
+      assert.ok(/TOOL_DECL_MODE=compact|工具声明/.test(err.message), `错误信息应指路 compact：${err.message}`);
+      return true;
+    },
+  );
+});
+
+test('压缩模式：工具声明能在正文里放下，不再触发拆分', () => {
+  const messages = [
+    { role: 'user', content: '开始' },
+    { role: 'assistant', content: '好的' },
+    { role: 'user', content: '继续' },
+  ];
+  const tools = manyTools(100, 200); // 完整声明约 200KB，压缩后约 10KB
+  const built = buildPrompt({ messages, tools, toolDeclMode: 'compact' });
+
+  assert.ok(built.prompt.length < 100_000, `压缩后应放得下，实际 ${built.prompt.length}`);
+  assert.ok(built.prompt.includes('## Tool_functions:'), '正文要有工具声明');
+  assert.ok(built.prompt.includes('tool_0(command:string*'), '应当是压缩格式');
+  const plan = planOverflow(built.prompt, { maxChars: 100_000, maxAttachmentChars: 2_000_000 });
+  assert.equal(plan.attachment, null, '压缩后不该再拆附件');
 });

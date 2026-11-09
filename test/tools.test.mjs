@@ -6,6 +6,7 @@ import {
   normalizeArguments,
   parseToolCalls,
   readJsonObject,
+  renderCompactToolDeclarations,
   renderToolDeclarations,
   renderToolResult,
 } from '../src/prompt/tools.mjs';
@@ -332,4 +333,54 @@ test('parse: 原生 token / DSML / DO 混用不会重复', () => {
     calls.map((c) => c.name),
     ['exec_shell', 'bash'],
   );
+});
+
+test('compact: 一行一个工具，标出必填与类型', () => {
+  const lines = renderCompactToolDeclarations([
+    {
+      type: 'function',
+      function: {
+        name: 'bash',
+        description: '执行 shell 命令',
+        parameters: {
+          type: 'object',
+          properties: { command: { type: 'string' }, timeout: { type: 'number' } },
+          required: ['command'],
+        },
+      },
+    },
+  ]);
+  assert.deepEqual(lines, ['bash(command:string*, timeout:number) — 执行 shell 命令']);
+});
+
+test('compact: 没有参数也能渲染', () => {
+  const lines = renderCompactToolDeclarations([{ function: { name: 'browser_status', description: '查看浏览器' } }]);
+  assert.deepEqual(lines, ['browser_status() — 查看浏览器']);
+});
+
+test('compact: 长描述被截断，且拒绝没有名字的工具', () => {
+  const lines = renderCompactToolDeclarations([
+    { function: { name: 'x', description: '长'.repeat(500) } },
+    { function: { description: '没有名字' } },
+  ]);
+  assert.equal(lines.length, 1);
+  assert.ok(lines[0].length < 120, `压缩后应显著变短，实际 ${lines[0].length}`);
+});
+
+test('compact: 体积远小于完整 JSON 声明', () => {
+  const tools = Array.from({ length: 60 }, (_, i) => ({
+    type: 'function',
+    function: {
+      name: `tool_${i}`,
+      description: `工具 ${i} ${'说明文字'.repeat(200)}`,
+      parameters: {
+        type: 'object',
+        properties: { command: { type: 'string' }, cwd: { type: 'string' } },
+        required: ['command'],
+      },
+    },
+  }));
+  const full = renderToolDeclarations(tools).join('\n').length;
+  const compact = renderCompactToolDeclarations(tools).join('\n').length;
+  assert.ok(compact * 5 < full, `压缩应至少省 80%，实际 ${compact}/${full}`);
 });

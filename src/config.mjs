@@ -163,6 +163,17 @@ export function loadConfig(env = process.env) {
       maxAttachmentChars: int(env.MAX_ATTACHMENT_CHARS, 2_000_000),
       // 关掉就恢复旧行为：超长直接 413
       overflowToAttachment: bool(env.OVERFLOW_TO_ATTACHMENT, true),
+      /**
+       * 工具声明形态：
+       *   auto（默认） 完整声明放得下就用完整，需要拆分时改用压缩索引
+       *   full         始终完整 JSON 声明
+       *   compact      始终压缩索引（一行一个工具）
+       * 工具声明永远不会被挪进附件，放不下会直接报错。
+       */
+      toolDeclMode: (() => {
+        const value = str(env.TOOL_DECL_MODE, 'auto').toLowerCase();
+        return ['auto', 'full', 'compact'].includes(value) ? value : 'auto';
+      })(),
       // 浏览器模式：抓页面自己发出的 /api/v0/chat/completion 原始流，用模型原始输出
       // （含 DO 工具调用 token）作为权威文本，DOM 只负责流式展示。关掉退回纯 DOM 提取。
       browserCapture: bool(env.BROWSER_CAPTURE, true),

@@ -15,6 +15,45 @@
 import { parseDsmlCalls } from './dsml.mjs';
 
 /** 把 OpenAI tools 定义渲染成「每行一个 JSON」的工具列表 */
+/** 压缩索引里描述保留多少字符 */
+const COMPACT_DESC_CHARS = 60;
+
+/**
+ * 压缩版工具声明：一行一个工具，只保留「能选对工具 + 能拼出必填参数」所需的信息。
+ *
+ *   bash(command:string*, timeout:number) — 执行 shell 命令
+ *
+ * 为什么需要：agent 动辄上百个工具，完整 JSON 声明能到 100KB，超过网页输入框上限，
+ * 以前会被整段挪进附件 —— 模型在正文里看不到工具声明，就会乱调工具
+ * （参数结构凭臆测，缺必填字段），最后干脆停摆。压缩后体积约剩 1/10。
+ *
+ * 星号标必填。描述截断只为省体积，选型够用即可；需要精确 schema 时走按需展开。
+ */
+export function renderCompactToolDeclarations(tools = []) {
+  const lines = [];
+  for (const tool of tools) {
+    const fn = tool?.function ?? tool;
+    if (!fn || typeof fn.name !== 'string' || !fn.name.trim()) continue;
+
+    const params = fn.parameters?.properties;
+    const required = new Set(Array.isArray(fn.parameters?.required) ? fn.parameters.required : []);
+    const args = params && typeof params === 'object'
+      ? Object.entries(params).map(([key, value]) => {
+          const type = value?.type || 'any';
+          return `${key}:${type}${required.has(key) ? '*' : ''}`;
+        })
+      : [];
+
+    const desc = String(fn.description ?? '')
+      .replace(/\s+/g, ' ')
+      .trim()
+      .slice(0, COMPACT_DESC_CHARS);
+
+    lines.push(`${fn.name.trim()}(${args.join(', ')})${desc ? ` — ${desc}` : ''}`);
+  }
+  return lines;
+}
+
 export function renderToolDeclarations(tools = []) {
   const lines = [];
   for (const tool of tools) {

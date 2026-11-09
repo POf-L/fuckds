@@ -64,26 +64,33 @@ export function planOverflow(prompt, options = {}) {
   const noteLength = buildNote(PLACEHOLDER, dialogs.length).length;
   /** 已移进附件的块（保持原始顺序，先 head 后 dialog） */
   const removed = [];
-  let movedHead = 0;
+  /** 已挪走的 head 块下标（Tool_functions 永远不会进来） */
+  const removedHead = new Set();
 
-  const budgetNow = () => {
-    const inlineHead =
-      header.length +
-      protocol.text.length +
-      headBlocks.slice(movedHead).reduce((sum, block) => sum + block.text.length, 0);
-    return maxChars - reserve - inlineHead - noteLength;
-  };
+  const inlineHeadChars = () =>
+    header.length +
+    protocol.text.length +
+    headBlocks.reduce((sum, block, i) => (removedHead.has(i) ? sum : sum + block.text.length), 0);
 
-  // 自带协议提示词之后的 system / 工具声明：正文空间不够时按从前往后的顺序挪进附件
-  while (movedHead < headBlocks.length && budgetNow() < minDialogChars) {
-    removed.push(headBlocks[movedHead]);
-    movedHead += 1;
+  const budgetNow = () => maxChars - reserve - inlineHeadChars() - noteLength;
+
+  // 自带协议提示词之前的 system：正文空间不够时按从前往后的顺序挪进附件。
+  //
+  // 工具声明（Tool_functions）**永远不挪**：挪进附件后模型在正文里看不到工具 schema，
+  // 只能凭猜拼参数（实测会发出缺必填字段的调用），最后干脆停摆。
+  // 真放不下就让它落到下面的 PromptTooLongError，提示改 TOOL_DECL_MODE=compact。
+  for (let i = 0; i < headBlocks.length && budgetNow() < minDialogChars; i += 1) {
+    if (headBlocks[i].kind === 'Tool_functions') continue;
+    removed.push(headBlocks[i]);
+    removedHead.add(i);
   }
 
   const budget = budgetNow();
   if (budget <= 0) {
     throw new PromptTooLongError(
-      `system / 工具声明太长：正文可用空间只剩 ${budget} 字符（上限 ${maxChars}），无法保留任何对话内容`,
+      `工具声明/system 太长：正文可用空间只剩 ${budget} 字符（上限 ${maxChars}），无法保留任何对话内容。` +
+        '工具声明不会再被挪进附件（否则模型看不到 schema 会乱调工具）；' +
+        '请改用 TOOL_DECL_MODE=compact 压缩工具声明，或减少工具数量。',
     );
   }
 
@@ -100,6 +107,9 @@ export function planOverflow(prompt, options = {}) {
   let attachmentBody;
   let makeTail;
   let removedCount;
+
+  /** 被挪进附件的段的类型与体量（诊断用） */
+  const movedKinds = removed.map((block) => ({ kind: block.kind, chars: block.text.length }));
 
   if (keepFrom === dialogs.length) {
     // 最新一段自己就超预算：保留尾部，前面进附件
@@ -140,7 +150,16 @@ export function planOverflow(prompt, options = {}) {
   const attachmentText = `${buildAttachmentTitle(removedCount)}${attachmentBody}`;
   const name = fileNameFor(attachmentText);
   const note = buildNote(name, removedCount);
-  const inline = `${header}${protocol.text}${note}${makeTail(name)}`;
+
+  // 没被挪走的 head 块（客户端 system / 工具声明）必须拼回正文。
+  // 历史 bug：这里只拼了 header + 协议提示词，于是「留在正文」的 head 块
+  // 既不在正文、也不在附件，直接蒸发 —— 工具声明就此消失，模型只能凭猜拼参数。
+  const inlineHeadText = headBlocks
+    .filter((_, index) => !removedHead.has(index))
+    .map((block) => block.text)
+    .join('');
+
+  const inline = `${header}${inlineHeadText}${protocol.text}${note}${makeTail(name)}`;
 
   if (inline.length > maxChars) {
     throw new PromptTooLongError(
@@ -156,6 +175,9 @@ export function planOverflow(prompt, options = {}) {
       buffer: Buffer.from(attachmentText, 'utf8'),
       chars: attachmentText.length,
       sections: removedCount,
+      // 诊断：到底把哪些段挪进了附件。工具声明被挪走时模型会失去工具格式约定，
+      // 表现为乱调工具（参数结构错、漏必填字段），这里要能一眼看出来。
+      moved: movedKinds,
     },
   };
 }

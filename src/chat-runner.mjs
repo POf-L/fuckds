@@ -28,12 +28,35 @@ export function createChatRunner({ config, log, web }) {
    * @param {(text: string) => void} [hooks.onReasoning] 流式思考增量
    */
   return async function runChat(request, { signal, meta = {}, onPrompt, onContent, onReasoning } = {}) {
-    const { maxPromptChars, maxAttachmentChars, overflowToAttachment } = config.runtime;
+    const { maxPromptChars, maxAttachmentChars, overflowToAttachment, toolDeclMode = 'auto' } = config.runtime;
 
-    /** 拼 prompt；超过输入框上限时把较早的段落拆成附件 */
+    /**
+     * 拼 prompt；超过输入框上限时把较早的段落拆成附件。
+     *
+     * auto 模式下：完整工具声明放得下就用完整；一旦需要拆分，就改用压缩索引重建。
+     * 否则上百个工具的完整声明（可能上百 KB）会把正文挤干，模型等于看不到对话。
+     */
     const prepare = (systemExtra = '') => {
-      const built = buildPrompt({ messages: request.messages, tools: request.tools, systemExtra });
+      const mode = toolDeclMode;
+      const build = (declMode) =>
+        buildPrompt({ messages: request.messages, tools: request.tools, systemExtra, toolDeclMode: declMode });
+
+      let built = build(mode === 'compact' ? 'compact' : 'full');
       if (!overflowToAttachment) return { built, prompt: built.prompt, attachment: null };
+
+      // 完整声明就已经放得下：直接用，不做任何压缩
+      if (mode !== 'compact' && built.prompt.length <= maxPromptChars) {
+        return { built, prompt: built.prompt, attachment: null };
+      }
+
+      // auto：需要拆分时改压缩索引，把正文空间腾给对话
+      if (mode === 'auto') {
+        built = build('compact');
+        if (built.prompt.length <= maxPromptChars) {
+          return { built, prompt: built.prompt, attachment: null };
+        }
+      }
+
       const plan = planOverflow(built.prompt, { maxChars: maxPromptChars, maxAttachmentChars });
       return { built, prompt: plan.prompt, attachment: plan.attachment };
     };
@@ -60,6 +83,8 @@ export function createChatRunner({ config, log, web }) {
         name: plan.attachment.name,
         chars: plan.attachment.chars,
         sections: plan.attachment.sections,
+        // 工具声明被挪进附件时模型会丢格式约定，必须能从日志看出来
+        moved: plan.attachment.moved,
       });
       return ids;
     };

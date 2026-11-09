@@ -1,7 +1,7 @@
 import { ApiError } from '../errors.mjs';
 import { contentToText } from '../util.mjs';
 import { FINAL_ANSWER_HINT, PROMPT_HEADER, REPLY_END_TOKEN, SECTION, SPECIAL_TOKENS_HEADER } from './special.mjs';
-import { collectToolNames, renderToolDeclarations, renderToolResult } from './tools.mjs';
+import { collectToolNames, renderCompactToolDeclarations, renderToolDeclarations, renderToolResult } from './tools.mjs';
 
 const VALID_ROLES = new Set(['system', 'developer', 'user', 'assistant', 'tool', 'function']);
 
@@ -43,7 +43,7 @@ const VALID_ROLES = new Set(['system', 'developer', 'user', 'assistant', 'tool',
  * - 工具结果**单独成段**（## Tool_call_result），不塞进 ## Assistant，
  *   模型就不会把「assistant 说调用、然后自己写结果」当成正确的模仿对象。
  */
-export function buildPrompt({ messages, tools = [], systemExtra = '' }) {
+export function buildPrompt({ messages, tools = [], systemExtra = '', toolDeclMode = 'full' }) {
   if (!Array.isArray(messages) || messages.length === 0) {
     throw new ApiError(400, 'messages 不能为空', { code: 'invalid_messages' });
   }
@@ -109,7 +109,9 @@ export function buildPrompt({ messages, tools = [], systemExtra = '' }) {
   const systemBody = [...systemTexts, extra].filter(Boolean).join('\n\n');
   if (systemBody) parts.push(systemBody);
 
-  const toolLines = renderToolDeclarations(tools);
+  // full：完整 JSON 声明；compact：一行一个工具（体积约剩 1/10，且永不挪进附件）
+  const toolLines =
+    toolDeclMode === 'compact' ? renderCompactToolDeclarations(tools) : renderToolDeclarations(tools);
   if (toolLines.length) {
     parts.push('', SECTION.tools, ...toolLines);
   }
@@ -137,6 +139,7 @@ export function buildPrompt({ messages, tools = [], systemExtra = '' }) {
       sections: sections.length,
       systemMessages: systemTexts.length,
       tools: toolLines.length,
+      toolDeclMode,
     },
   };
 }
