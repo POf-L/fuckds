@@ -547,8 +547,12 @@ export function createAdminHandler({ config, logger, web }) {
       entries.set(fingerprint, {
         fingerprint,
         fingerprintShort: fingerprint.slice(0, 12),
-        // 展示用名字：来自该账号自己的 profile 目录（多账号 = hybrid-profiles/<名字>）
-        label: creds.profileDir ? path.basename(creds.profileDir) : path.basename(file),
+        // 展示用名字：来自该账号自己的 profile 目录（多账号 = hybrid-profiles/<名字>）。
+        // 旧凭据（早于 profileDir 记录功能）和默认 profile 统一显示「默认账号」，
+        // 不再暴露 protocol-credentials.json 这类文件名。
+        label: creds.profileDir && path.resolve(creds.profileDir) !== path.resolve(config.hybrid.profileDir)
+          ? path.basename(creds.profileDir)
+          : '默认账号',
         file: path.basename(file),
         profileDir: creds.profileDir || null,
         harvestedAt: creds.harvestedAt ?? null,

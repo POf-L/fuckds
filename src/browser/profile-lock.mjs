@@ -90,6 +90,18 @@ async function cdpReachable(port, timeoutMs = 1_500) {
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 /**
+ * DeepSeek 国内直连可达；Chromium 默认继承系统代理，而本机系统代理链路
+ * （BitBoo 127.0.0.1:1086）抖动时页面导航直接 ERR_TUNNEL_CONNECTION_FAILED
+ * （2026-11-09 面板登录实测）。网关的 Node 侧请求本来就不走代理（undici 直连），
+ * 浏览器侧也对齐成直连；确需代理时设 DEEPSEEK_PROXY=http://host:port 显式指定。
+ */
+export function deepseekProxySwitch() {
+  return process.env.DEEPSEEK_PROXY
+    ? `--proxy-server=${process.env.DEEPSEEK_PROXY}`
+    : '--no-proxy-server';
+}
+
+/**
  * 是否已有活着的 profile 浏览器实例（只读，不启动任何东西）。
  * 返回端口号或 null。
  */
@@ -189,7 +201,7 @@ export async function launchOrReusePersistent({
 
     let context;
     try {
-      context = await launch(['--remote-debugging-port=0']);
+      context = await launch(['--remote-debugging-port=0', deepseekProxySwitch()]);
       const port = await waitForDevToolsPort(profileDir, readyTimeoutMs);
       try {
         fs.writeFileSync(
