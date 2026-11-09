@@ -2,10 +2,20 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 
+import { chromium } from 'playwright';
+
 import { ApiError } from '../errors.mjs';
 import { loadTokens, maskToken, normalizeUserToken, saveTokens } from '../auth.mjs';
 import { createEngine } from '../engine.mjs';
 import { modelsResponse } from '../openai/response.mjs';
+import { launchOrReusePersistent } from '../browser/profile-lock.mjs';
+import { fingerprintOf } from '../direct/account-pool.mjs';
+import {
+  extractCredentialsFromContext,
+  hasLoginMarker,
+  loadCredentials,
+  saveCredentials,
+} from '../protocol/credentials.mjs';
 
 /**
  * 后台管理接口 + 静态页面托管。
@@ -74,6 +84,12 @@ export function createAdminHandler({ config, logger, web }) {
 
   /** 同一时间只跑一批 token 校验，避免把账号打爆 */
   let verifying = false;
+
+  /** 协议通道：进行中的面板登录会话（同一时间只允许一个）；null = 没有 */
+  let protocolLogin = null;
+
+  /** 登录会话的进行中阶段（这些阶段允许取消 / 不允许发起新会话） */
+  const LOGIN_ACTIVE_PHASES = new Set(['launching', 'waiting-login', 'harvesting']);
 
   /** @returns {Promise<boolean>} 是否已经处理（false 交给上层 404） */
   return async function handleAdmin(req, res, url) {
@@ -149,6 +165,28 @@ export function createAdminHandler({ config, logger, web }) {
       return sendJson(res, 200, await restartServer());
     }
 
+    if (route === 'POST /admin/api/protocol/login') {
+      const body = await readJsonBody(req);
+      return sendJson(res, 200, startProtocolLogin(body));
+    }
+
+    if (route === 'GET /admin/api/protocol/login') {
+      return sendJson(res, 200, { login: protocolLogin ? publicLoginState() : null });
+    }
+
+    if (route === 'POST /admin/api/protocol/login/cancel') {
+      return sendJson(res, 200, cancelProtocolLogin());
+    }
+
+    if (route === 'GET /admin/api/protocol/accounts') {
+      return sendJson(res, 200, buildProtocolAccounts());
+    }
+
+    if (route === 'POST /admin/api/protocol/accounts/remove') {
+      const body = await readJsonBody(req);
+      return sendJson(res, 200, await removeProtocolAccount(body));
+    }
+
     throw new ApiError(404, `未知接口: ${route}`, { code: 'not_found' });
   }
 
@@ -215,19 +253,67 @@ export function createAdminHandler({ config, logger, web }) {
     };
   }
 
+  /**
+   * 把一段文本识别成「一组条目」，识别不了返回 null（交给上层继续拆）：
+   *   - 裸 token / 带引号串：不含空白、逗号、分号 → 整体一条
+   *   - localStorage 的 {"value":"...","__version":"0"}：整体一条，内部的逗号不是分隔符
+   *   - JSON 数组（["a","b"] / [{"value":"a"},…]）：按元素拆
+   *   - Bearer xxx：空格属于同一条
+   */
+  function trySingleEntry(text) {
+    const t = String(text ?? '').trim();
+    if (!t) return null;
+    if (!/[\s,;]/.test(t)) return [t];
+    if (t.startsWith('{')) {
+      try {
+        const parsed = JSON.parse(t);
+        if (parsed && typeof parsed.value === 'string') return [t];
+      } catch {
+        // 整体不是合法的 {"value":...} JSON，交给上层按行/分隔符继续拆
+      }
+    }
+    if (t.startsWith('[')) {
+      try {
+        const parsed = JSON.parse(t);
+        if (Array.isArray(parsed)) return parsed.map((item) => String(item ?? ''));
+      } catch {
+        // 不是合法 JSON 数组，继续
+      }
+    }
+    if (/^bearer\s+\S+$/i.test(t) && !/[,;]/.test(t)) return [t];
+    return null;
+  }
+
+  /** 多条混合文本 → 候选条目列表：先整体识别，失败按行拆，行内再按空白/逗号/分号拆 */
+  function splitTokenText(text) {
+    const single = trySingleEntry(text);
+    if (single) return single;
+    const out = [];
+    for (const line of String(text ?? '').split(/\r?\n/)) {
+      const t = line.trim();
+      if (!t) continue;
+      const lineSingle = trySingleEntry(t);
+      if (lineSingle) {
+        out.push(...lineSingle);
+        continue;
+      }
+      for (const piece of t.split(/[\s,;]+/)) {
+        if (piece) out.push(piece);
+      }
+    }
+    return out;
+  }
+
   function parseTokenInput(input) {
-    const list = Array.isArray(input)
-      ? input
-      : String(input ?? '')
-          .split(/[\s,;]+/)
-          .filter(Boolean);
-    if (!list.length) throw new ApiError(400, '没有提供 token');
-    if (list.length > MAX_TOKENS_PER_REQUEST) {
+    const list = Array.isArray(input) ? input.map((raw) => String(raw ?? '')) : splitTokenText(input);
+    const cleaned = list.map((raw) => String(raw).trim()).filter(Boolean);
+    if (!cleaned.length) throw new ApiError(400, '没有提供 token');
+    if (cleaned.length > MAX_TOKENS_PER_REQUEST) {
       throw new ApiError(400, `一次最多提交 ${MAX_TOKENS_PER_REQUEST} 个 token`);
     }
-    return list.map((raw, index) => {
+    return cleaned.map((raw, index) => {
       try {
-        return normalizeUserToken(String(raw));
+        return normalizeUserToken(raw);
       } catch (err) {
         throw new ApiError(400, `第 ${index + 1} 个 token 不合法：${err.message}`);
       }
@@ -270,6 +356,271 @@ export function createAdminHandler({ config, logger, web }) {
       savedCount: tokens.length,
       restartRequired: true,
       message: '已从 data/auth.json 删除，重启服务后生效。',
+    };
+  }
+
+  /* ------------------ 协议通道（推荐）：面板浏览器登录 + 账号管理 ------------------ */
+
+  function publicLoginState() {
+    if (!protocolLogin) return null;
+    const { cancelRequested, ...rest } = protocolLogin;
+    return rest;
+  }
+
+  function startProtocolLogin(body) {
+    if (protocolLogin && LOGIN_ACTIVE_PHASES.has(protocolLogin.phase)) {
+      throw new ApiError(409, '已有登录会话进行中，请先完成或取消');
+    }
+    const account = String(body?.account ?? '').trim();
+    if (account && !/^[A-Za-z0-9_-]{1,32}$/.test(account)) {
+      throw new ApiError(400, '账号名只允许字母/数字/下划线/连字符（1-32 字符）');
+    }
+    const profileDir = account
+      ? path.join(config.dataDir, 'hybrid-profiles', account)
+      : config.hybrid.profileDir;
+    fs.mkdirSync(profileDir, { recursive: true });
+    const state = {
+      account,
+      profileDir,
+      phase: 'launching',
+      message: '正在启动浏览器…',
+      error: null,
+      startedAt: Date.now(),
+      finishedAt: null,
+      fingerprint: null,
+      addedToPool: false,
+      restartRequired: false,
+      cancelRequested: false,
+    };
+    protocolLogin = state;
+    void runProtocolLogin(state);
+    return { login: publicLoginState() };
+  }
+
+  function cancelProtocolLogin() {
+    if (!protocolLogin) throw new ApiError(404, '没有进行中的登录会话');
+    if (LOGIN_ACTIVE_PHASES.has(protocolLogin.phase)) protocolLogin.cancelRequested = true;
+    return { login: publicLoginState() };
+  }
+
+  async function runProtocolLogin(state) {
+    let launched = null;
+    try {
+      launched = await launchOrReusePersistent({
+        chromium,
+        profileDir: state.profileDir,
+        log,
+        launch: async (extraArgs) => {
+          const launchArgs = [
+            '--disable-gpu',
+            '--no-first-run',
+            '--no-default-browser-check',
+            '--disable-blink-features=AutomationControlled',
+            ...extraArgs,
+          ];
+          const options = {
+            headless: false,
+            viewport: config.browser.viewport,
+            locale: config.browser.locale,
+            timezoneId: process.env.TZ || 'Asia/Shanghai',
+          };
+          if (config.hybrid.executablePath) {
+            return chromium.launchPersistentContext(state.profileDir, {
+              ...options,
+              executablePath: config.hybrid.executablePath,
+              args: launchArgs,
+            });
+          }
+          try {
+            return await chromium.launchPersistentContext(state.profileDir, {
+              ...options,
+              channel: config.hybrid.channel,
+              args: launchArgs,
+            });
+          } catch (err) {
+            log.warn?.(`channel=${config.hybrid.channel} 启动失败，回退自带 Chromium：${err.message}`);
+            return chromium.launchPersistentContext(state.profileDir, { ...options, args: launchArgs });
+          }
+        },
+      });
+      const ctx = launched.context;
+      const page = ctx.pages()[0] || (await ctx.newPage());
+      state.phase = 'waiting-login';
+      state.message = '请在打开的浏览器里完成登录（最多 10 分钟，可随时取消）';
+      const baseUrl = config.browser.baseUrl || 'https://chat.deepseek.com';
+      await page.goto(`${baseUrl}/sign_in`, { waitUntil: 'domcontentloaded', timeout: 60_000 });
+      const deadline = Date.now() + 10 * 60_000;
+      let ok = false;
+      while (Date.now() < deadline) {
+        if (state.cancelRequested) return;
+        // 判据与 login-hybrid 一致：拿到 token 且已离开 /sign_in（游客态也带 token，必须同时看 URL）
+        const token = await page
+          .evaluate(() => {
+            try {
+              return Boolean(localStorage.getItem('userToken'));
+            } catch {
+              return false;
+            }
+          })
+          .catch(() => false);
+        if (token && !page.url().includes('/sign_in')) {
+          ok = true;
+          break;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 2_500));
+      }
+      if (state.cancelRequested) return;
+      if (!ok) {
+        state.phase = 'failed';
+        state.error = '10 分钟内未完成登录，可重新发起';
+        return;
+      }
+      state.phase = 'harvesting';
+      state.message = '登录成功，正在采集凭据（等待 hif 缓存落盘）…';
+      let creds = null;
+      for (let i = 0; i < 8; i += 1) {
+        await page.waitForTimeout(1_500);
+        if (state.cancelRequested) return;
+        const record = await extractCredentialsFromContext(ctx, page).catch(() => null);
+        if (record && hasLoginMarker(record)) {
+          creds = record;
+          break;
+        }
+      }
+      if (state.cancelRequested) return;
+      if (!creds) {
+        state.phase = 'failed';
+        state.error = '登录成功但未拿到 hif 缓存（可能是匿名态），请重新发起登录';
+        return;
+      }
+      creds.profileDir = state.profileDir;
+      const fingerprint = fingerprintOf(creds.userToken);
+      const file = state.account
+        ? path.join(config.protocol.accountsDir, `account-${fingerprint}.json`)
+        : config.protocol.credentialsFile;
+      saveCredentials(file, creds);
+      state.fingerprint = fingerprint;
+      if (typeof web.addProtocolAccount === 'function') {
+        web.addProtocolAccount(creds);
+        state.addedToPool = true;
+        state.phase = 'done';
+        state.message = `登录成功：账号 ${fingerprint.slice(0, 12)} 已加入号池（无需重启）`;
+      } else {
+        state.restartRequired = true;
+        state.phase = 'done';
+        state.message = `登录成功：凭据已写入 ${path.basename(file)}，重启服务后生效`;
+      }
+      log.info('面板协议登录完成', {
+        account: state.account || 'default',
+        fingerprint: fingerprint.slice(0, 12),
+        file: path.basename(file),
+      });
+    } catch (err) {
+      state.phase = 'failed';
+      state.error = err?.message || String(err);
+      state.message = null;
+      log.error?.('面板协议登录失败:', err);
+    } finally {
+      if (state.cancelRequested && !['failed', 'done', 'cancelled'].includes(state.phase)) {
+        state.phase = 'cancelled';
+        state.message = '已取消登录';
+      }
+      state.finishedAt = Date.now();
+      try {
+        if (launched?.reused) await launched.browser?.close?.().catch(() => {});
+        else await launched?.context?.close?.().catch(() => {});
+      } catch {
+        /* 关闭失败不影响结果 */
+      }
+    }
+  }
+
+  function buildProtocolAccounts() {
+    const status = typeof web.status === 'function' ? web.status() : {};
+    const poolByPrefix = new Map((status.accounts ?? []).map((account) => [account.accountHash, account]));
+    const entries = new Map();
+    const addFile = (file) => {
+      const creds = loadCredentials(file);
+      if (!creds?.userToken) return;
+      const fingerprint = fingerprintOf(creds.userToken);
+      const pool = poolByPrefix.get(fingerprint.slice(0, 12)) ?? null;
+      entries.set(fingerprint, {
+        fingerprint,
+        fingerprintShort: fingerprint.slice(0, 12),
+        // 展示用名字：来自该账号自己的 profile 目录（多账号 = hybrid-profiles/<名字>）
+        label: creds.profileDir ? path.basename(creds.profileDir) : path.basename(file),
+        file: path.basename(file),
+        profileDir: creds.profileDir || null,
+        harvestedAt: creds.harvestedAt ?? null,
+        ageMs: creds.harvestedAt ? Date.now() - creds.harvestedAt : null,
+        hasLoginMarker: hasLoginMarker(creds),
+        inPool: Boolean(pool),
+        credentialState: pool?.credentialState ?? null,
+        dispatchable: pool?.dispatchable ?? null,
+        available: pool?.available ?? null,
+        inflight: pool?.inflight ?? 0,
+        queued: pool?.queued ?? 0,
+        cooldownMs: pool?.cooldownMs ?? 0,
+        lastAuthError: pool?.lastAuthError ?? null,
+      });
+    };
+    try {
+      for (const name of fs.readdirSync(config.protocol.accountsDir)) {
+        if (!name.endsWith('.json')) continue;
+        addFile(path.join(config.protocol.accountsDir, name));
+      }
+    } catch {
+      /* 目录不存在 */
+    }
+    addFile(config.protocol.credentialsFile);
+    return {
+      engine: status.engine ?? config.engine,
+      accountsDir: config.protocol.accountsDir,
+      credentialsFile: config.protocol.credentialsFile,
+      supportsHotAdd: typeof web.addProtocolAccount === 'function',
+      accounts: [...entries.values()],
+    };
+  }
+
+  async function removeProtocolAccount(body) {
+    const fingerprint = String(body?.fingerprint ?? '').trim();
+    if (!fingerprint || !/^[a-f0-9]{6,128}$/i.test(fingerprint)) {
+      throw new ApiError(400, 'fingerprint 不合法');
+    }
+    const candidates = [];
+    try {
+      for (const name of fs.readdirSync(config.protocol.accountsDir)) {
+        if (name.endsWith('.json')) candidates.push(path.join(config.protocol.accountsDir, name));
+      }
+    } catch {
+      /* 目录不存在 */
+    }
+    candidates.push(config.protocol.credentialsFile);
+    const removedFiles = [];
+    for (const file of candidates) {
+      const creds = loadCredentials(file);
+      if (creds?.userToken && fingerprintOf(creds.userToken) === fingerprint) {
+        fs.rmSync(file, { force: true });
+        removedFiles.push(path.basename(file));
+      }
+    }
+    if (!removedFiles.length) throw new ApiError(404, '没有找到这个账号的凭据文件');
+    let removedFromPool = false;
+    if (typeof web.removeProtocolAccount === 'function') {
+      removedFromPool = await web.removeProtocolAccount(fingerprint);
+    }
+    log.info('协议账号已删除', {
+      fingerprint: fingerprint.slice(0, 12),
+      removedFiles,
+      removedFromPool,
+    });
+    return {
+      ok: true,
+      removedFiles,
+      removedFromPool,
+      message: removedFromPool
+        ? '已从号池和磁盘删除，立即生效（浏览器 profile 登录态保留，可随时重新登录恢复）'
+        : '已删除凭据文件，重启服务后生效（浏览器 profile 登录态保留）',
     };
   }
 

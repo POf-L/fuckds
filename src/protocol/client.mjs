@@ -287,9 +287,10 @@ export class ProtocolEngine {
   /**
    * 从“已经在运行的 profile 实例”读当前 cookie/token/hif。
    * 没有实例就返回 null —— 绝不为了刷新凭据自己启动第二个浏览器。
+   * creds 指定账号时用该账号自己的 profile（多账号各自独立），否则默认 profile。
    */
-  async #harvestLiveCredentials() {
-    const profileDir = this.config.hybrid?.profileDir;
+  async #harvestLiveCredentials(creds = null) {
+    const profileDir = this.#profileDirOf(creds);
     if (!profileDir || !(await liveProfilePort(profileDir))) return null;
     try {
       return await harvestCredentials({
@@ -297,6 +298,7 @@ export class ProtocolEngine {
         logger: this.log,
         reuseOnly: true,
         waitMs: 0,
+        profileDir,
       });
     } catch (err) {
       this.log.warn?.('从活的 profile 同步凭据失败，沿用最近快照', { message: err.message });
@@ -309,7 +311,7 @@ export class ProtocolEngine {
     const fingerprint = fingerprintOf(creds.userToken);
     const found = this.accounts.find((account) => account.fingerprint === fingerprint);
     if (found) {
-      found.creds = creds;
+      found.creds = { ...found.creds, ...creds };
       if (found.engine?.config?.deepseek) {
         found.engine.config.deepseek.protocolExtras = buildProtocolExtras(creds);
       }
@@ -317,25 +319,46 @@ export class ProtocolEngine {
       this.log.info?.('已从活的 profile 同步凭据（cookie/hif 更新，未启动浏览器）');
       return;
     }
-    // token 变了（用户在同一个 profile 里重新登录过一次）：落盘并重建引擎
-    const old = this.accounts.map((account) => account.engine);
+    // token 变了（该 profile 里重新登录/换了账号）：同 profile 的旧账号让位，
+    // 其他 profile 的账号一律不动（多账号池不被单 profile 的换号冲垮）
+    const dir = creds.profileDir || this.config.hybrid?.profileDir || null;
+    const outgoing = dir
+      ? this.accounts.filter((account) => this.#profileDirOf(account.creds) === dir)
+      : [];
+    const keepers = this.accounts.filter((account) => !outgoing.includes(account));
     const file = this.#saveCredential(creds);
-    this.#buildEngines([{ creds, file }]);
+    const incoming = this.#buildAccount({ creds, file });
+    this.accounts = [...keepers, incoming];
+    this.inner = this.accounts[0]?.engine ?? null;
     this.credentialSource = 'live-profile';
-    this.log.info?.('活的 profile 里是另一个登录态，已切换账号');
-    for (const engine of old) void engine?.close?.().catch?.(() => {});
+    this.log.info?.('活的 profile 里是另一个登录态，已切换/新增账号', {
+      fingerprint: incoming.fingerprint.slice(0, 12),
+      replaced: outgoing.length,
+      total: this.accounts.length,
+    });
+    for (const account of outgoing) void account.engine?.close?.().catch?.(() => {});
   }
 
-  /** 每 60s 最多同步一次，避免每个请求都去读页面 */
+  /** 每 60s 最多同步一次，避免每个请求都去读页面；多账号时逐个探测各自 profile 的活实例 */
   async #syncFromLiveProfile() {
     if (Date.now() - this.lastLiveSyncAt < 60_000) return false;
-    const profileDir = this.config.hybrid?.profileDir;
-    if (!profileDir || !(await liveProfilePort(profileDir))) return false;
+    // 去重后的 profile 目录 → 用来定位账号（同 profile 只采一次；null = 默认 profile，冷启动兜底）
+    const dirs = new Map();
+    for (const creds of [...this.accounts.map((account) => account.creds), null]) {
+      const dir = this.#profileDirOf(creds);
+      if (!dir || dirs.has(dir)) continue;
+      if (await liveProfilePort(dir)) dirs.set(dir, creds);
+    }
+    if (!dirs.size) return false;
     this.lastLiveSyncAt = Date.now();
-    const creds = await this.#harvestLiveCredentials();
-    if (!creds) return false;
-    this.#applyLiveCredentials(creds);
-    return true;
+    let synced = false;
+    for (const [dir, creds] of dirs) {
+      const fresh = await this.#harvestLiveCredentials(creds);
+      if (!fresh) continue;
+      this.#applyLiveCredentials(fresh);
+      synced = true;
+    }
+    return synced;
   }
 
   async #loadOrHarvest(force) {
@@ -369,25 +392,33 @@ export class ProtocolEngine {
   }
 
   #buildEngines(loaded) {
-    this.accounts = loaded.map(({ creds, file }) => {
-      const fingerprint = fingerprintOf(creds.userToken);
-      const deepseek = {
-        ...this.config.deepseek,
-        token: creds.userToken,
-        tokens: [creds.userToken],
-        deviceIds: { [creds.userToken]: creds.deviceId },
-        protocolExtras: buildProtocolExtras(creds),
-      };
-      const engine = new DirectEngine({
-        config: { ...this.config, deepseek },
-        logger: this.log.child('protocol-direct'),
-      });
-      return { creds, file, fingerprint, engine };
-    });
+    this.accounts = loaded.map((entry) => this.#buildAccount(entry));
     this.inner = this.accounts[0]?.engine ?? null;
     this.log.info?.(`协议通道已加载 ${this.accounts.length} 个账号`, {
       accounts: this.accounts.map((account) => account.fingerprint.slice(0, 12)),
     });
+  }
+
+  /** 单账号 → { creds, file, fingerprint, engine }（每账号一个独立 DirectEngine/调度队列） */
+  #buildAccount({ creds, file }) {
+    const fingerprint = fingerprintOf(creds.userToken);
+    const deepseek = {
+      ...this.config.deepseek,
+      token: creds.userToken,
+      tokens: [creds.userToken],
+      deviceIds: { [creds.userToken]: creds.deviceId },
+      protocolExtras: buildProtocolExtras(creds),
+    };
+    const engine = new DirectEngine({
+      config: { ...this.config, deepseek },
+      logger: this.log.child('protocol-direct'),
+    });
+    return { creds, file, fingerprint, engine };
+  }
+
+  /** 账号自己的 profile 优先（多账号各自独立 profile 自动续）；老凭据无此字段回退全局默认 */
+  #profileDirOf(creds) {
+    return creds?.profileDir || this.config.hybrid?.profileDir || null;
   }
 
   /**
@@ -435,7 +466,11 @@ export class ProtocolEngine {
    */
   async #refreshCredentials(fingerprint = null) {
     const key = fingerprint || 'default';
-    const profileDir = this.config.hybrid?.profileDir;
+    // 目标账号：指纹匹配的优先（多账号各自刷新自己的 profile），找不到回退第一个
+    const target = (fingerprint && this.accounts.find((account) => account.fingerprint === fingerprint))
+      || this.accounts[0]
+      || null;
+    const profileDir = this.#profileDirOf(target?.creds);
     const livePort = profileDir ? await liveProfilePort(profileDir) : null;
     const minIntervalMs = this.config.protocol.refreshMinIntervalMs ?? 60_000;
     const decision = decideRefresh({
@@ -474,7 +509,7 @@ export class ProtocolEngine {
     this.refreshAttempts.set(key, { at: this.lastRefreshAt, result: 'failed' });
 
     if (decision.action === 'live') {
-      const live = await this.#harvestLiveCredentials();
+      const live = await this.#harvestLiveCredentials(target?.creds);
       if (!live) {
         this.lastRefreshResult = 'failed';
         const err = new Error('从活的 profile 实例读取凭据失败');
@@ -483,27 +518,104 @@ export class ProtocolEngine {
       }
       // 同一 token：原地更新 cookie/hif（引擎不重建）；token 变了：落盘并重建
       this.#applyLiveCredentials(live);
-      // 刷新成功即清除上一次 401 留下的 authFailed 停用标记，否则重试会被号池直接拒掉
-      for (const account of this.accounts) {
-        const pool = account.engine?.pool;
-        if (!pool) continue;
-        for (const inner of pool.accounts ?? []) pool.markHealthy(inner);
-      }
+      // 刷新成功即清除新凭据对应账号 401 留下的 authFailed 停用标记，
+      // 否则重试会被号池直接拒掉（只动这个账号，其他账号的标记不受牵连）
+      this.#clearAuthFailed(live);
       this.refreshAttempts.set(key, { at: this.lastRefreshAt, result: 'success' });
       this.lastRefreshResult = 'success';
       this.degradations += 1;
       return true;
     }
 
-    // 仅当 ALLOW_BROWSER_REFRESH=true（用户显式授权）才启动浏览器
-    const old = this.accounts.map((account) => account.engine);
-    this.accounts = [];
-    this.inner = null;
-    for (const engine of old) await engine?.close?.().catch?.(() => {});
-    await this.#loadOrHarvest(true);
+    // 仅当 ALLOW_BROWSER_REFRESH=true（用户显式授权）才启动浏览器：
+    // 只重采目标账号自己的 profile（其他账号一律不动），拿到后同指纹就地更新、异指纹替换同 profile 账号
+    let fresh = null;
+    try {
+      fresh = await harvestCredentials({
+        config: this.config,
+        logger: this.log,
+        profileDir,
+        // staleToken：页面有机会从会话 cookie 重新鉴权，等到「不一样的 token」才算真续上
+        staleToken: target?.creds?.userToken ?? null,
+      });
+    } catch (err) {
+      this.lastRefreshResult = 'failed';
+      this.log.warn?.('协议通道：重采目标账号 profile 失败', { message: err.message });
+      throw err;
+    }
+    // 采集到的还是同一个 token：会话 cookie 也死了，拿旧 token 重试只会制造 502 风暴。
+    // 判刷新失败，让上层按 401 + 重新登录指引返回（opencode 对 401 不重试）。
+    if (
+      target?.creds?.userToken
+      && fingerprintOf(fresh.userToken) === fingerprintOf(target.creds.userToken)
+    ) {
+      this.lastRefreshResult = 'failed';
+      this.log.warn?.('协议通道：重采后 token 指纹未变化，profile 会话已失效', {
+        fingerprint: fingerprintOf(fresh.userToken).slice(0, 12),
+      });
+      const err = new Error(
+        'profile 会话已失效：重采后 token 未变化（会话 cookie 也过期了）。请到 /admin 面板「账号」页重新登录，或运行 npm run auth:hybrid',
+      );
+      err.code = 'refresh_failed';
+      throw err;
+    }
+    this.#applyLiveCredentials(fresh);
+    this.#clearAuthFailed(fresh);
     this.refreshAttempts.set(key, { at: this.lastRefreshAt, result: 'success' });
     this.lastRefreshResult = 'success';
     this.degradations += 1;
+    return true;
+  }
+
+  /** 刷新成功后清掉新凭据对应账号在号池里的 authFailed 标记（只动这一个账号） */
+  #clearAuthFailed(creds) {
+    if (!creds?.userToken) return;
+    const fingerprint = fingerprintOf(creds.userToken);
+    const account = this.accounts.find((item) => item.fingerprint === fingerprint);
+    const pool = account?.engine?.pool;
+    if (!pool) return;
+    for (const inner of pool.accounts ?? []) pool.markHealthy(inner);
+  }
+
+  /**
+   * 面板登录成功后热加入号池（不重启服务）。
+   * 同指纹 → 原地更新凭据并清 authFailed 标记；新指纹 → 落盘 + 建引擎 + 热追加。
+   */
+  addProtocolAccount(creds) {
+    if (!creds?.userToken) throw new Error('addProtocolAccount: 缺少 userToken');
+    const fingerprint = fingerprintOf(creds.userToken);
+    const found = this.accounts.find((account) => account.fingerprint === fingerprint);
+    if (found) {
+      found.creds = { ...found.creds, ...creds };
+      if (found.engine?.config?.deepseek) {
+        found.engine.config.deepseek.protocolExtras = buildProtocolExtras(found.creds);
+      }
+      this.#clearAuthFailed(found.creds);
+      this.log.info?.('协议通道：面板登录后账号凭据已热更新', { fingerprint: fingerprint.slice(0, 12) });
+      return { fingerprint, updated: true, total: this.accounts.length };
+    }
+    const file = this.#saveCredential(creds);
+    const account = this.#buildAccount({ creds, file });
+    this.accounts = [...this.accounts, account];
+    if (!this.inner) this.inner = account.engine;
+    this.credentialSource = this.accounts.length > 1 ? `cache:${this.accounts.length}-accounts` : 'cache';
+    this.log.info?.(`协议通道：面板登录的新账号已热加入号池（共 ${this.accounts.length} 个）`, {
+      fingerprint: fingerprint.slice(0, 12),
+    });
+    return { fingerprint, updated: false, total: this.accounts.length };
+  }
+
+  /** 面板删除账号：热移出号池并关闭该账号引擎；返回是否真的移除了 */
+  async removeProtocolAccount(fingerprint) {
+    const index = this.accounts.findIndex((account) => account.fingerprint === fingerprint);
+    if (index < 0) return false;
+    const [removed] = this.accounts.splice(index, 1);
+    if (this.inner === removed.engine) this.inner = this.accounts[0]?.engine ?? null;
+    await removed.engine?.close?.().catch?.(() => {});
+    this.log.info?.('协议通道：账号已热移除', {
+      fingerprint: fingerprint.slice(0, 12),
+      remaining: this.accounts.length,
+    });
     return true;
   }
 
@@ -567,7 +679,22 @@ export class ProtocolEngine {
         this.layer = 'hybrid';
         this.degradations += 1;
         this.hybrid = new HybridEngine({ config: this.config, logger: this.log.child('hybrid') });
-        return this.hybrid.chat(args);
+        try {
+          return await this.hybrid.chat(args);
+        } catch (hybridErr) {
+          if (!looksLikeCredentialFailure(hybridErr)) throw hybridErr;
+          // 降级后 hybrid 也报凭据失效：会话整体死了，不是 protocol 层的实现问题。
+          // 回滚到 protocol 层——否则 layer=hybrid 永久粘住，重新登录也无法自愈（只能重启进程，
+          // 2026-11-08 晚 502 风暴实测）；并把错误统一成 401，客户端/opencode 对 401 不重试。
+          this.layer = 'protocol';
+          const deadHybrid = this.hybrid;
+          this.hybrid = null;
+          void deadHybrid?.close?.().catch?.(() => {});
+          this.lastReason = `hybrid 降级同样失败: ${hybridErr.message}`;
+          throw hybridErr.name === 'AuthExpiredError'
+            ? hybridErr
+            : new AuthExpiredError(`协议凭据失效（hybrid 降级后同样失败）：${hybridErr.message}`);
+        }
       }
     }
   }

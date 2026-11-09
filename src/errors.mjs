@@ -2,6 +2,7 @@
 export const AUTH_NEXT_ACTION = Object.freeze({
   action: 're-login',
   command: 'npm run auth:hybrid',
+  panel: '/admin → 账号 → 协议通道账号 → 打开登录窗口',
   doc: '使用手册 §6',
 });
 
@@ -17,7 +18,7 @@ export const CHALLENGE_NEXT_ACTION = Object.freeze({
   note: '在已登录的同一个浏览器实例里完成人机挑战；网关不会自动新开浏览器',
 });
 
-const AUTH_GUIDANCE = '请重新登录：npm run auth:hybrid';
+const AUTH_GUIDANCE = '请重新登录：/admin 面板「账号」页，或 npm run auth:hybrid';
 
 function authGuidanceOf(err) {
   return err?.code === 'deepseek_auth_required' ? AUTH_NEXT_ACTION : null;
@@ -70,7 +71,7 @@ export class UpstreamError extends ApiError {
 
 export class AuthExpiredError extends UpstreamError {
   constructor(
-    message = 'DeepSeek 登录态无效或已过期。请重新登录：npm run auth:hybrid（使用手册 §6）',
+    message = 'DeepSeek 登录态无效或已过期。请到 /admin 面板「账号」页重新登录，或运行 npm run auth:hybrid（使用手册 §6）',
   ) {
     // 凭据失效必须是 401：客户端要能据此重新登录，而不是当成上游 5xx 无脑重试。
     // code 保持 deepseek_auth_required，方便日志/监控按 code 聚合。

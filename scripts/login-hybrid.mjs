@@ -6,6 +6,12 @@
  *   npm run auth:hybrid -- --from-cdp http://127.0.0.1:9222
  *                                      # 从已登录的外部浏览器复制 storageState 引导一次
  *                                      # （仅用于本机迁移登录态；不打印任何 token/cookie 值）
+ *   npm run auth:hybrid -- --account B  # 多账户：账号 B 用独立 profile（data/hybrid-profiles/B）
+ *                                      # 凭据写入 data/protocol-accounts/，服务重启后自动进池轮转
+ *
+ * 多账户：每个账号跑一次 --account <name>（name 用字母/数字/_/-），各自独立浏览器
+ * profile 保存登录态，互不顶号；协议通道加载 data/protocol-accounts/*.json 全部账号，
+ * 按负载轮转，凭据失效时按各账号自己的 profile 自动续。
  *
  * 注意：默认 profile 是 data/hybrid-profile，不会碰用户日常浏览器，也不会默认连 9222。
  */
@@ -27,8 +33,16 @@ import {
 const args = process.argv.slice(2);
 const fromCdpIdx = args.indexOf('--from-cdp');
 const fromCdp = fromCdpIdx >= 0 ? String(args[fromCdpIdx + 1] || '') : '';
+const accountIdx = args.indexOf('--account');
+const accountName = accountIdx >= 0 ? String(args[accountIdx + 1] || '') : '';
+if (accountIdx >= 0 && !/^[A-Za-z0-9_-]{1,32}$/.test(accountName)) {
+  console.error('--account 需要一个名字（字母/数字/下划线/连字符，1-32 字符），例如：npm run auth:hybrid -- --account B');
+  process.exit(2);
+}
 const config = loadConfig();
-const profileDir = config.hybrid.profileDir;
+const profileDir = accountName
+  ? path.join(config.dataDir, 'hybrid-profiles', accountName)
+  : config.hybrid.profileDir;
 const channel = config.hybrid.channel;
 const executablePath = config.hybrid.executablePath;
 
@@ -114,7 +128,7 @@ if (fromCdp) {
     fs.rmSync(statePath, { force: true });
   }
 } else {
-  console.log(`打开独立 profile：${profileDir}`);
+  console.log(`打开独立 profile：${profileDir}${accountName ? `（账号 ${accountName}）` : ''}`);
   console.log('请在打开的浏览器里登录 https://chat.deepseek.com（脚本会等待登录完成，最多 10 分钟）');
   console.log('完成后会自动把凭据写入 data/（0600），无需手动复制 token。');
   const launched = await launch();
@@ -156,10 +170,17 @@ if (fromCdp) {
         console.error('登录成功但未拿到 hif 缓存（可能是匿名态）。凭据未写入，请保持页面打开后重新运行。');
         ok = false;
       } else {
-        const file = config.protocol.credentialsFile;
+        // 记录来源 profile：自动续/刷新时按账号自己的 profile 找登录态
+        creds.profileDir = profileDir;
+        // 多账户：写 data/protocol-accounts/<指纹>.json（服务自动聚合全部账号）；
+        // 默认路径保持旧行为写 legacy 单文件
+        const file = accountName
+          ? path.join(config.protocol.accountsDir, `account-${fingerprintOf(creds.userToken)}.json`)
+          : config.protocol.credentialsFile;
         saveCredentials(file, creds);
         saved = { file, hash: fingerprintOf(creds.userToken).slice(0, 12), ageMs: Date.now() - creds.harvestedAt };
         console.log(`登录成功，凭据已写入 ${file}（0600，哈希前缀 ${saved.hash}）`);
+        if (accountName) console.log('重启服务后新账号自动加入号池轮转（data/protocol-accounts/）。');
         console.log('登录态同时保存在 profile 中；hybrid 层可复用。');
       }
     } else {

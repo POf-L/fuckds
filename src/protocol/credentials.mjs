@@ -161,17 +161,20 @@ export async function harvestCredentials({
   logger,
   waitMs = config.protocol?.harvestWaitMs ?? 2500,
   reuseOnly = false,
+  profileDir = null,
+  staleToken = null,
 }) {
   const startedAt = Date.now();
-  const profileDir = config.hybrid.profileDir;
+  // 多账号：每个账号可以有独立 profile；不传时回退默认 hybrid profile
+  const dir = profileDir || config.hybrid.profileDir;
   // reuseOnly：只允许从“已经在跑的 profile 实例”读，读不到就返回 null（绝不新开浏览器）
-  if (reuseOnly && !(await liveProfilePort(profileDir))) return null;
+  if (reuseOnly && !(await liveProfilePort(dir))) return null;
   const launched = await launchOrReusePersistent({
     chromium,
-    profileDir,
+    profileDir: dir,
     log: logger,
     launch: (extraArgs) =>
-      chromium.launchPersistentContext(profileDir, {
+      chromium.launchPersistentContext(dir, {
         headless: false,
         channel: config.hybrid.channel || undefined,
         args: [...hybridLaunchArgs(), ...extraArgs],
@@ -184,12 +187,44 @@ export async function harvestCredentials({
     await page
       .waitForFunction(() => Boolean(localStorage.getItem('userToken')), { timeout: 15000 })
       .catch(() => {});
+    // staleToken：上次采集的 token 已被上游判定失效。页面加载时会尝试用会话 cookie
+    // 重新鉴权并刷新 localStorage 里的 token；等到「不一样的 token」才算真续上。
+    // 超时（cookie 也死了）就按当前状态继续——调用方的指纹校验会拦住假刷新。
+    if (staleToken) {
+      await page
+        .waitForFunction(
+          (stale) => {
+            try {
+              const raw = localStorage.getItem('userToken');
+              if (!raw) return false;
+              let value = raw;
+              try {
+                const parsed = JSON.parse(raw);
+                if (typeof parsed === 'string') value = parsed;
+                else if (parsed && typeof parsed.value === 'string') value = parsed.value;
+              } catch {
+                /* 原始字符串 */
+              }
+              return Boolean(value) && value !== stale;
+            } catch {
+              return false;
+            }
+          },
+          staleToken,
+          { timeout: 30_000, polling: 1_000 },
+        )
+        .catch(() => {
+          logger?.warn?.('等待新 token 超时（会话 cookie 可能也失效了），按当前页面状态继续');
+        });
+    }
     if (waitMs > 0) await page.waitForTimeout(waitMs);
     const record = await extractCredentialsFromContext(ctx, page, startedAt);
     if (!record.userToken) throw new Error('profile 里没有 userToken');
     if (!hasLoginMarker(record)) {
       throw new Error('profile 里只有匿名 guest token（缺 hif 缓存），不是登录态，拒绝缓存');
     }
+    // 记录来源 profile：多账号世界里每个凭据要能找到自己的浏览器登录态（自动续/刷新用）
+    record.profileDir = dir;
     logger?.info?.('协议凭据已采集', credentialSummary(record));
     return record;
   } finally {
