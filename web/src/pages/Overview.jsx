@@ -134,12 +134,16 @@ export default function Overview({ navigate }) {
         <Stat
           label="登录态"
           icon="vpn_key"
-          tone={data.savedCount ? (authFailed ? 'error' : 'ok') : 'error'}
-          value={data.savedCount ? `${data.savedCount} 个 token` : '未配置'}
+          tone={accounts.length ? (authFailed ? 'error' : 'ok') : 'error'}
+          value={accounts.length ? `运行中 ${accounts.length} 个账号` : '未配置'}
           hint={
-            data.savedCount
-              ? `运行中使用 ${accounts.length} 个 · ${available} 个当前可用${authFailed ? ` · ${authFailed} 个失效` : ''}`
-              : '去「账号」页粘贴 userToken'
+            accounts.length
+              ? `${available} 个当前可用${authFailed ? ` · ${authFailed} 个失效` : ''}${
+                  data.engine === 'protocol' && data.savedCount
+                    ? ` · 另有 ${data.savedCount} 个粘贴 token（未使用）`
+                    : ''
+                }`
+              : '去「账号」页添加'
           }
         />
         <Stat
