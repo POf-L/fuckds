@@ -30,6 +30,32 @@ const API_ERROR_RETRY_DELAY_MS = 500;
 export const AUTH_INVALID_COOLDOWN_MS = 24 * 60 * 60_000;
 
 /**
+ * DeepSeek 的登录态失效不走 HTTP 401，而是 HTTP 200 + 业务错误：
+ *
+ *   {"code":40003,"msg":"INVALID_TOKEN","data":null}
+ *
+ * 只按 res.status 判定的话，这类响应会落进通用的 UpstreamError，
+ * 对外表现为「登录失效被说成限流」/「单 token 时完全不标记」两种错误语义。
+ *
+ * 这里只认 **msg 精确等于这几个值**（不做宽松正则）：
+ * 「Authorization Failed (invalid token)」这类文案分不清是真失效还是风控临时拦截，
+ * 用它触发 24h 停用会把好号误锁一天（authFailed 一旦置位就不会自愈，必须换 token 才恢复）。
+ */
+const AUTH_INVALID_MESSAGES = new Set([
+  'INVALID_TOKEN',
+  'TOKEN_EXPIRED',
+  'TOKEN_INVALID',
+  'USER_NOT_FOUND',
+  'NOT_LOGGED_IN',
+]);
+
+/** 上游 msg / biz_msg 是否是明确的「登录态失效」 */
+export function isAuthInvalidMessage(message) {
+  if (!message) return false;
+  return AUTH_INVALID_MESSAGES.has(String(message).trim().toUpperCase());
+}
+
+/**
  * 判断错误是否属于「这个账号此刻不能用」，可以在同一个请求里换号重试。
  *
  * 客户端断开（499）、超时、参数类错误都跟账号无关，直接抛给调用方；
@@ -175,8 +201,12 @@ export class DirectEngine {
         if (!account) {
           const wait = this.pool.nextAvailableAt() - now;
           if (wait > maxCooldownWaitMs) {
-            // 所有号都是登录态失效停用的：报登录态错误，别让调用方误以为是限流
-            if (this.pool.allAuthFailed()) throw new AuthExpiredError();
+            // 所有号都是登录态失效停用的：报登录态错误，别让调用方误以为是限流。
+            //
+            // 以前只查 allAuthFailed()，但 INVALID_TOKEN 走的是普通 markUnavailable、
+            // 不会置 authFailed，于是「所有 token 都废了」被误报成 429 限流，
+            // 客户端会按 Retry-After 一直白等。改成看 lastFailureKind 才能识别。
+            if (this.pool.allAuthUnavailable()) throw new AuthExpiredError();
             throw new RateLimitError(
               `所有账号都在限流冷却中，约 ${Math.ceil(wait / 1000)}s 后恢复（可往号池加 token）`,
               { retryAfterMs: wait },
@@ -207,13 +237,22 @@ export class DirectEngine {
             this.pool.markLimited(account, retryAfterMs);
           } else if (err instanceof AuthExpiredError) {
             retryAfterMs = AUTH_INVALID_COOLDOWN_MS;
-            this.pool.markUnavailable(account, retryAfterMs, '登录态失效', { authFailed: true });
-          } else if (this.pool.size > 1) {
-            // 上游报错/人机验证：有别的号就轮换，没有别的号就别把自己锁死
-            retryAfterMs = Math.max(1000, accountCooldownMs);
-            this.pool.markUnavailable(account, retryAfterMs, err.message || '账号不可用');
+            this.pool.markUnavailable(account, retryAfterMs, '登录态失效', {
+              authFailed: true,
+              kind: 'auth',
+            });
           } else {
-            throw err;
+            // 上游报错 / 人机验证 / 登录态问题：先标记这个号，免得下次请求又从它开始重撞一遍。
+            //
+            // 以前这里分叉：pool.size > 1 才标记，单 token 直接 throw 什么都不记 ——
+            // 实测单 token 时 cooldownMs=0、errorCount=0、lastError=null、连一条 WARN 都没有，
+            // 每次请求都真打一次上游，白付一次 session + PoW。
+            //
+            // 标记但不「锁死」：用一个很短的冷却（最多 1s），这样唯一的号不会被困住，
+            // 又能把 lastError / errorCount 留下来，让调用方在 /healthz 和日志里看得见。
+            retryAfterMs = Math.min(1000, Math.max(0, accountCooldownMs));
+            this.pool.markUnavailable(account, retryAfterMs, err.message || '账号不可用');
+            if (this.pool.size === 1) throw err;
           }
 
           if (partialOutput) throw err;
@@ -327,7 +366,9 @@ export class DirectEngine {
             this.log.debug(`账号 #${account.index + 1} PoW 被拒（${message}），重新获取后重试一次`);
             continue;
           }
-          if (res.status === 401 || res.status === 403) throw new AuthExpiredError();
+          if (res.status === 401 || res.status === 403 || isAuthInvalidMessage(message)) {
+            throw new AuthExpiredError(message);
+          }
           if (res.status === 429 || /频繁|rate/i.test(message)) throw new RateLimitError(message);
 
           // 网页接口返回错误：重试最多 3 次再抛错
@@ -560,8 +601,10 @@ export class DirectEngine {
     const body = await readJsonSafely(res);
     const id = body?.data?.biz_data?.id;
     if (!id) {
-      if (res.status === 401 || res.status === 403) throw new AuthExpiredError();
       const message = body?.msg || body?.data?.biz_msg || `HTTP ${res.status}`;
+      if (res.status === 401 || res.status === 403 || isAuthInvalidMessage(message)) {
+        throw new AuthExpiredError(message);
+      }
       if (res.status === 429 || /频繁/.test(message)) throw new RateLimitError(message);
       this.log.warn('上传附件失败', { name, message, status: res.status });
       throw new UpstreamError(`上传附件失败：${message}`, { code: 'attachment_upload_failed' });
@@ -614,8 +657,10 @@ export class DirectEngine {
     const body = await readJsonSafely(res);
     const session = body?.data?.biz_data?.chat_session;
     if (!session?.id) {
-      if (res.status === 401 || res.status === 403) throw new AuthExpiredError();
       const message = body?.msg || body?.data?.biz_msg || `HTTP ${res.status}`;
+      if (res.status === 401 || res.status === 403 || isAuthInvalidMessage(message)) {
+        throw new AuthExpiredError(message);
+      }
       if (res.status === 429 || /频繁/.test(message)) throw new RateLimitError(message);
       throw new UpstreamError(`创建会话失败：${message}`, { code: 'session_failed' });
     }
@@ -631,11 +676,11 @@ export class DirectEngine {
     const body = await readJsonSafely(res);
     const challenge = body?.data?.biz_data?.challenge;
     if (!challenge) {
-      if (res.status === 401 || res.status === 403) throw new AuthExpiredError();
-      throw new UpstreamError(
-        `获取 PoW 挑战失败：${body?.msg || body?.data?.biz_msg || `HTTP ${res.status}`}`,
-        { code: 'pow_challenge_failed' },
-      );
+      const message = body?.msg || body?.data?.biz_msg || `HTTP ${res.status}`;
+      if (res.status === 401 || res.status === 403 || isAuthInvalidMessage(message)) {
+        throw new AuthExpiredError(message);
+      }
+      throw new UpstreamError(`获取 PoW 挑战失败：${message}`, { code: 'pow_challenge_failed' });
     }
     return challenge;
   }

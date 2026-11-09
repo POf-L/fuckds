@@ -26,6 +26,15 @@ export class AccountPool {
       lastError: null,
       /** 登录态失效：换 token / 重启进程之前这个号不会再被选中 */
       authFailed: false,
+      /**
+       * 最近一次失败的类型：'auth' | 'rate_limit' | 'upstream' | null。
+       *
+       * 用来在「所有号都在冷却」时给出正确的对外语义 ——
+       * 以前只看 authFailed 标志位，但 INVALID_TOKEN 走的是普通 markUnavailable，
+       * 不会置 authFailed，于是把登录失效误报成「所有账号都在限流冷却中」，
+       * 客户端会按 Retry-After 徒劳等待。
+       */
+      lastFailureKind: null,
       lastUsedAt: 0,
       requests: 0,
     }));
@@ -67,10 +76,22 @@ export class AccountPool {
     return this.accounts.length > 0 && this.accounts.every((a) => a.authFailed);
   }
 
+  /**
+   * 所有账号是不是都因为「登录态失效」在冷却（不只是 authFailed 标志位）。
+   *
+   * 用来区分「真限流」和「所有 token 都废了」：后者应当报 503 + 提示重新 auth，
+   * 而不是 429 让客户端按 Retry-After 白等。
+   */
+  allAuthUnavailable() {
+    if (!this.accounts.length) return false;
+    return this.accounts.every((a) => a.authFailed || a.lastFailureKind === 'auth');
+  }
+
   markLimited(account, ms) {
     account.cooldownUntil = Math.max(account.cooldownUntil, Date.now() + ms);
     account.limitedCount += 1;
     account.lastError = '触发限流';
+    account.lastFailureKind = 'rate_limit';
     const seconds = Math.round(ms / 100) / 10;
     this.log.warn(
       `账号 #${account.index + 1} 触发限流，冷却 ${seconds}s（池内还有 ${
@@ -83,10 +104,11 @@ export class AccountPool {
    * 账号级失败（登录态失效 / 上游报错）导致的停用。
    * 冷却期内这个号不会被选中，避免每次请求先撞一次坏号、要靠客户端重发才能换号。
    */
-  markUnavailable(account, ms, reason, { authFailed = false } = {}) {
+  markUnavailable(account, ms, reason, { authFailed = false, kind = 'upstream' } = {}) {
     account.cooldownUntil = Math.max(account.cooldownUntil, Date.now() + ms);
     account.errorCount += 1;
     account.lastError = reason;
+    account.lastFailureKind = kind;
     if (authFailed) account.authFailed = true;
     const seconds = Math.round(ms / 100) / 10;
     this.log.warn(
@@ -100,6 +122,7 @@ export class AccountPool {
     account.cooldownUntil = 0;
     account.authFailed = false;
     account.lastError = null;
+    account.lastFailureKind = null;
   }
 
   status() {
