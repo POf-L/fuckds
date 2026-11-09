@@ -113,6 +113,14 @@ export class DirectEngine {
     this.pool = new AccountPool({ tokens: this.tokens, dataDir: config.dataDir, logger });
     this.pow = new PowSolver({ bin: config.direct.powBin, logger });
     this.fileCache = new Map();
+    /**
+     * 上传得到的 file id → 上传它的账号 index。
+     * DeepSeek 的附件/图片是**账号私有**的：用 A 账号上传、再用 B 账号发请求，
+     * ref_file_ids 会被静默忽略 —— 模型只看到「已作为附件上传」的说明却读不到内容，
+     * 表现为莫名其妙地回一句「我遇到了问题」或者干脆不干活。
+     * 所以发请求时要按 file id 把账号钉回上传方。
+     */
+    this.fileOwners = new Map();
     this.inflight = 0;
     this.closed = false;
     this.coldStarted = false;
@@ -187,6 +195,17 @@ export class DirectEngine {
     }
     await this.ensureStarted();
 
+    // 附件是账号私有的：只要有 ref_file_ids，就锁定上传它们的那个账号
+    const fileOwnerIndex = (() => {
+      if (!refFileIds?.length) return null;
+      const owners = refFileIds
+        .map((fileId) => this.fileOwners.get(fileId))
+        .filter((index) => index !== undefined);
+      if (!owners.length) return null;
+      // 混了多个账号的文件就没法钉死，交给轮询
+      return owners.every((index) => index === owners[0]) ? owners[0] : null;
+    })();
+
     this.inflight += 1;
     const startedAt = Date.now();
     const { accountCooldownMs, rateLimitBackoffMs, maxCooldownWaitMs } = this.config.runtime;
@@ -197,7 +216,13 @@ export class DirectEngine {
         if (signal?.aborted) throw new UpstreamError('客户端已断开', { status: 499, code: 'client_closed' });
 
         const now = Date.now();
-        const account = this.pool.pick(now);
+        // 带 ref_file_ids 时必须回到上传它们的那个账号：附件是账号私有的，
+        // 换号会让附件静默丢失（模型读不到内容）。
+        const pinned =
+          fileOwnerIndex !== null && fileOwnerIndex !== undefined
+            ? this.pool.accounts[fileOwnerIndex] ?? null
+            : null;
+        const account = pinned && pinned.cooldownUntil <= now ? pinned : this.pool.pick(now);
         if (!account) {
           const wait = this.pool.nextAvailableAt() - now;
           if (wait > maxCooldownWaitMs) {
@@ -503,7 +528,6 @@ export class DirectEngine {
   async uploadImages(images = []) {
     if (!images.length) return [];
     await this.ensureStarted();
-    const account = this.#uploadAccount();
 
     const ids = [];
     for (const image of images) {
@@ -516,6 +540,7 @@ export class DirectEngine {
           code: 'image_too_large',
         });
       }
+      const account = this.#uploadAccount(this.#contentHash(buffer));
       ids.push(
         await this.#uploadFile(account, {
           buffer,
@@ -534,7 +559,6 @@ export class DirectEngine {
   async uploadAttachments(files = []) {
     if (!files.length) return [];
     await this.ensureStarted();
-    const account = this.#uploadAccount();
 
     const ids = [];
     for (const file of files) {
@@ -547,6 +571,7 @@ export class DirectEngine {
           code: 'attachment_too_large',
         });
       }
+      const account = this.#uploadAccount(this.#contentHash(buffer));
       ids.push(
         await this.#uploadFile(account, {
           buffer,
@@ -558,20 +583,56 @@ export class DirectEngine {
     return ids;
   }
 
-  #uploadAccount() {
+  /**
+   * 选一个账号来上传。
+   *
+   * 用内容 hash 决定账号（而不是每次轮询），这样：
+   *  - 同一份内容永远落在同一个账号上，`文件 → 账号` 的归属稳定，缓存才能真正命中；
+   *  - 轮询会让同一内容每次换号上传，既浪费请求，也会让缓存永远 miss。
+   *
+   * 优先在「已经存过这份内容」的账号上复用，否则按 hash 落到某个可用账号。
+   */
+  #uploadAccount(hash) {
+    if (this.pool.size === 1) return this.pool.accounts[0];
+
+    // 已经缓存过这份内容：必须回到那个账号，否则文件 id 不通
+    if (hash) {
+      for (const [key, entry] of this.fileCache) {
+        if (entry.expiresAt > Date.now() && key.endsWith(`:${hash}`)) {
+          const index = Number.parseInt(key.slice(0, key.indexOf(':')), 10);
+          const owner = this.pool.accounts[index];
+          if (owner && owner.cooldownUntil <= Date.now()) return owner;
+        }
+      }
+      // 按 hash 稳定映射到一个账号；避开冷却中的
+      const now = Date.now();
+      const usable = this.pool.accounts.filter((account) => account.cooldownUntil <= now);
+      const list = usable.length ? usable : this.pool.accounts;
+      let sum = 0;
+      for (let i = 0; i < hash.length; i += 1) sum = (sum * 31 + hash.charCodeAt(i)) % 1000003;
+      return list[sum % list.length];
+    }
+
     const account = this.pool.pick() || this.pool.accounts[0];
     if (!account) throw new AuthExpiredError();
     return account;
   }
 
+  /** 内容 hash（和 #uploadFile 里的缓存 key 用同一套算法） */
+  #contentHash(buffer) {
+    return crypto.createHash('sha256').update(buffer).digest('hex');
+  }
+
   async #uploadFile(account, file) {
     const { buffer, mime, name } = file;
-    const hash = crypto.createHash('sha256').update(buffer).digest('hex');
-    const cached = this.fileCache.get(hash);
+    const hash = this.#contentHash(buffer);
+    // 同一个文件在不同账号下是两个互不相通的 file id，缓存必须按账号隔离
+    const cacheKey = `${account.index}:${hash}`;
+    const cached = this.fileCache.get(cacheKey);
     if (cached && cached.expiresAt > Date.now()) return cached.id;
     // 原来只在命中时检查过期：长期运行的进程里过期条目永远不删，
     // Map 会随上传次数无限增长。这里在写入前顺手清掉过期项并设上限。
-    if (cached) this.fileCache.delete(hash);
+    if (cached) this.fileCache.delete(cacheKey);
     if (this.fileCache.size >= 512) {
       const now = Date.now();
       for (const [key, entry] of this.fileCache) {
@@ -610,8 +671,9 @@ export class DirectEngine {
       throw new UpstreamError(`上传附件失败：${message}`, { code: 'attachment_upload_failed' });
     }
 
-    this.fileCache.set(hash, { id, expiresAt: Date.now() + FILE_CACHE_TTL_MS });
-    this.log.debug('附件已上传', { name, bytes: buffer.length });
+    this.fileCache.set(cacheKey, { id, expiresAt: Date.now() + FILE_CACHE_TTL_MS });
+    this.fileOwners.set(id, account.index);
+    this.log.debug('附件已上传', { name, bytes: buffer.length, account: account.index + 1 });
     return id;
   }
 
