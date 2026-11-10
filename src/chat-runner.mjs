@@ -11,7 +11,7 @@ import { buildDeltaPrompt, buildPrompt, collectToolNamesById } from './prompt/bu
 import { planOverflow } from './prompt/overflow.mjs';
 import { assertNoProtocolTags } from './prompt/sanitize.mjs';
 import { parseTextToolCalls, scanTextToolCallBlocks } from './prompt/text-protocol.mjs';
-import { parseToolCalls } from './prompt/tools.mjs';
+import { coerceToolCallArguments, getToolSchemas, parseToolCalls } from './prompt/tools.mjs';
 import { conversationKey, hashId } from './session/store.mjs';
 
 /**
@@ -79,7 +79,7 @@ export function createChatRunner({ config, log, web, sessions = null }) {
    * @param {(text: string) => void} [hooks.onReasoning] 流式思考增量
    */
   async function runChatCore(request, { signal, meta = {}, onPrompt, onContent, onReasoning } = {}) {
-    const { maxPromptChars, maxAttachmentChars, overflowToAttachment } = config.runtime;
+    const { maxPromptChars, maxAttachmentChars, overflowToAttachment, toolDeclMode = 'auto' } = config.runtime;
 
     /**
      * 上送前风控自检：拼好的 prompt（含附件正文）里只要还有 XML 协议标签，就拒绝发送。
@@ -92,12 +92,31 @@ export function createChatRunner({ config, log, web, sessions = null }) {
       if (plan.attachment) assertNoProtocolTags(plan.attachment.buffer.toString('utf8'), '附件');
     };
 
-    /** 拼全量 prompt；超过输入框上限时把较早的段落拆成附件 */
+    /**
+     * 拼全量 prompt；超过输入框上限时把较早的段落拆成附件。
+     *
+     * auto 模式下：完整工具声明放得下就用完整；一旦需要拆分，就改用压缩索引重建。
+     * 否则上百个工具的完整声明（可能上百 KB）会把正文挤干，模型等于看不到对话。
+     */
     const buildFull = () => {
-      const built = buildPrompt({ messages: request.messages, tools: request.tools });
-      const plan = overflowToAttachment
-        ? planOverflow(built.prompt, { maxChars: maxPromptChars, maxAttachmentChars })
-        : { prompt: built.prompt, attachment: null };
+      const build = (declMode) =>
+        buildPrompt({ messages: request.messages, tools: request.tools, toolDeclMode: declMode });
+      let built = build(toolDeclMode === 'compact' ? 'compact' : 'full');
+      let plan;
+      if (!overflowToAttachment) {
+        plan = { prompt: built.prompt, attachment: null };
+      } else if (toolDeclMode !== 'compact' && built.prompt.length <= maxPromptChars) {
+        // 完整声明就已经放得下：直接用，不做任何压缩
+        plan = { prompt: built.prompt, attachment: null };
+      } else if (toolDeclMode === 'auto') {
+        // auto：需要拆分时改压缩索引，把正文空间腾给对话
+        built = build('compact');
+        plan = built.prompt.length <= maxPromptChars
+          ? { prompt: built.prompt, attachment: null }
+          : planOverflow(built.prompt, { maxChars: maxPromptChars, maxAttachmentChars });
+      } else {
+        plan = planOverflow(built.prompt, { maxChars: maxPromptChars, maxAttachmentChars });
+      }
       guard(plan, built.protocolText);
       return { built, plan };
     };
@@ -193,6 +212,8 @@ export function createChatRunner({ config, log, web, sessions = null }) {
         name: attachmentPlan.attachment.name,
         chars: attachmentPlan.attachment.chars,
         sections: attachmentPlan.attachment.sections,
+        // 工具声明被挪进附件时模型会丢格式约定，必须能从日志看出来
+        moved: attachmentPlan.attachment.moved,
       });
       return ids;
     };
@@ -271,6 +292,21 @@ export function createChatRunner({ config, log, web, sessions = null }) {
         : null;
 
     const knownTools = toolNames.length ? toolNames : null;
+    const knownToolSet = knownTools ? new Set(knownTools) : null;
+    // 工具声明的 schema：原来只知道工具名，参数类型错了也原样发给客户端。
+    // 现在按声明纠正一次可还原的类型错误（见 tools.mjs），缺失值绝不编造。
+    const toolSchemas = getToolSchemas(request.tools);
+    const finalizeToolCalls = (calls) =>
+      calls.map((call) => {
+        const { arguments: coerced, warnings } = coerceToolCallArguments(call, toolSchemas);
+        if (warnings.length) {
+          log?.warn('工具调用参数与声明不符（已纠正可还原的部分，缺失值未编造）', {
+            name: call.name,
+            warnings,
+          });
+        }
+        return coerced === call.arguments ? call : { ...call, arguments: coerced };
+      });
 
     /**
      * 把一段原始输出整理成协议无关的语义：有效工具调用 + 干净正文。
@@ -282,7 +318,8 @@ export function createChatRunner({ config, log, web, sessions = null }) {
       const parsed = parseToolCalls(text, knownTools);
       // 不再做「重复调用抑制」：agent 里同一个调用原样重发是正常操作（每一步之后重新 observe_screen），
       // 按签名去重会把整轮输出吞成空回答。
-      const toolCalls = parsed;
+      // 但参数要按声明纠正一次：模型常把数字/布尔/数组写成字符串，见 tools.mjs。
+      const toolCalls = finalizeToolCalls(parsed);
       const content = stripToolMarkup(text);
 
       // 纯文本协议的成功率：只在模型真的写了哨兵块时统计。
@@ -316,17 +353,21 @@ export function createChatRunner({ config, log, web, sessions = null }) {
           log?.warn('解析出了工具调用但没交给客户端（不该发生，检查 evaluate 的过滤逻辑）', {
             names: parsed.map((call) => call.name),
           });
-        } else if (findToolMarkup(text).length) {
-          log?.warn('模型输出了协议块，但没解析出任何工具调用（工具名不在声明里，或 DSML 结构对不上）', {
-            protocolBlocks: findToolMarkup(text).map((block) => block.kind),
-          });
+        } else {
+          // 协议扫描是全文正则，算一次复用，别在空回答分支里白跑两遍。
+          const blocks = findToolMarkup(text);
+          if (blocks.length) {
+            log?.warn('模型输出了协议块，但没解析出任何工具调用（工具名不在声明里，或 DSML 结构对不上）', {
+              protocolBlocks: blocks.map((block) => block.kind),
+            });
+          }
         }
       }
 
       // 未知工具名是「模型自己在乱叫」的信号：照实返回（客户端会回一条 unknown tool 让它纠正），
       // 但不能静默——以前这里连日志都没有，出事只能靠猜。
-      if (toolCalls.length && knownTools) {
-        const unknown = toolCalls.filter((call) => !knownTools.includes(call.name));
+      if (toolCalls.length && knownToolSet) {
+        const unknown = toolCalls.filter((call) => !knownToolSet.has(call.name));
         if (unknown.length) {
           log?.warn('模型调用了未声明的工具，已照实返回给客户端', {
             names: unknown.map((call) => call.name),
@@ -348,7 +389,7 @@ export function createChatRunner({ config, log, web, sessions = null }) {
     /** 可见正文为空时，工具调用可能只写在思考里（DeepSeek 的常见行为）：提升成正式调用 */
     const promoteFromReasoning = (reasoning, reply) => {
       if (reply.content.trim() || reply.toolCalls.length || !reasoning) return reply;
-      const toolCalls = parseToolCalls(reasoning, knownTools);
+      const toolCalls = finalizeToolCalls(parseToolCalls(reasoning, knownTools));
       return toolCalls.length ? { ...reply, toolCalls } : reply;
     };
 

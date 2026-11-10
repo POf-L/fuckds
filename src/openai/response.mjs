@@ -1,5 +1,7 @@
 import crypto from 'node:crypto';
 
+import { estimateTokens } from '../util.mjs';
+
 export const MODELS = [
   { id: 'deepseek-flash', object: 'model', created: 0, owned_by: 'deepseek-web' },
   { id: 'deepseek-reasoner', object: 'model', created: 0, owned_by: 'deepseek-web' },
@@ -53,9 +55,9 @@ export function buildChatChunk({ id, model, delta, finishReason = null }) {
  * （工具调用轮次思考多、正文少时尤其明显，看起来就像「一调用工具就掉速」）。
  */
 export function estimateUsage(promptText, completionText, reasoningText = '') {
-  const prompt = estimate(promptText);
-  const reasoning = estimate(reasoningText);
-  const completion = estimate(completionText) + reasoning;
+  const prompt = estimateTokens(promptText);
+  const reasoning = estimateTokens(reasoningText);
+  const completion = estimateTokens(completionText) + reasoning;
   const usage = {
     prompt_tokens: prompt,
     completion_tokens: completion,
@@ -64,15 +66,4 @@ export function estimateUsage(promptText, completionText, reasoningText = '') {
   };
   if (reasoning > 0) usage.completion_tokens_details = { reasoning_tokens: reasoning };
   return usage;
-}
-
-function estimate(text) {
-  if (!text) return 0;
-  let cjk = 0;
-  let other = 0;
-  for (const ch of text) {
-    if (ch.charCodeAt(0) > 0x2e80) cjk += 1;
-    else other += 1;
-  }
-  return Math.max(1, Math.ceil(cjk + other / 4));
 }

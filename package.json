@@ -7,9 +7,6 @@
   "engines": {
     "node": ">=20.11"
   },
-  "bin": {
-    "fuckds": "bin/cli.mjs"
-  },
   "scripts": {
     "start": "node src/index.mjs",
     "dev": "node --watch src/index.mjs",
@@ -30,6 +27,7 @@
     "restart": "node scripts/server-ctl.mjs restart",
     "status": "node scripts/server-ctl.mjs status",
     "pow:build": "node scripts/build-pow.mjs",
+    "package": "node scripts/package.mjs",
     "admin:install": "npm --prefix web install",
     "admin:build": "npm --prefix web run build",
     "admin:dev": "npm --prefix web run dev"

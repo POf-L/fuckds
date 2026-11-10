@@ -32,16 +32,48 @@ export function contentToText(content, role = 'user') {
   return chunks.join('\n');
 }
 
-/** 极粗略的 token 估算：中文按 1 字 1 token，其余按 4 字符 1 token */
+/**
+ * 极粗略的 token 估算：中文按 1 字 1 token，其余按 4 字符 1 token。
+ *
+ * 原实现对每个字符跑一次正则，超长 prompt（10 万字起）下是可观的
+ * 常数开销；改成码点区间比较，并按码点（而非 UTF-16 单元）计数，
+ * 表情等增补字符不再被算成两个。openai/response.mjs 原来还有一份
+ * 逻辑相同但阈值不同的私有实现，现统一到这里，两协议口径一致。
+ */
 export function estimateTokens(text) {
   if (!text) return 0;
   let cjk = 0;
   let other = 0;
   for (const ch of text) {
-    if (/[\u3400-\u9fff\uf900-\ufaff\u3000-\u303f\uff00-\uffef]/.test(ch)) cjk += 1;
+    if (ch.codePointAt(0) > 0x2e80) cjk += 1;
     else other += 1;
   }
   return Math.max(1, Math.ceil(cjk + other / 4));
+}
+
+/**
+ * 解析 .env 文本：config.mjs（启动加载）和 admin/routes.mjs（后台读配置）
+ * 原来各写了一份，且对引号/注释的处理要保持一致，抽到这里。
+ * 返回键值对象；不处理 export 前缀以外的 shell 语法，和原来保持一致。
+ */
+export function parseEnvText(text) {
+  const out = {};
+  for (const rawLine of String(text).split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line || line.startsWith('#')) continue;
+    const eq = line.indexOf('=');
+    if (eq <= 0) continue;
+    const key = line.slice(0, eq).trim();
+    let value = line.slice(eq + 1).trim();
+    if (
+      (value.startsWith('"') && value.endsWith('"')) ||
+      (value.startsWith("'") && value.endsWith("'"))
+    ) {
+      value = value.slice(1, -1);
+    }
+    out[key] = value;
+  }
+  return out;
 }
 
 export function commonPrefixLength(a, b) {

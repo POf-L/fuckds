@@ -20,7 +20,7 @@ import {
   typingDelay,
 } from './fingerprint.mjs';
 import { PowSolver } from './pow.mjs';
-import { applyPatch, createSseParser, createStreamState } from './stream.mjs';
+import { applyPatch, createSseParser, createStreamState, createTextTracker } from './stream.mjs';
 
 const COMPLETION_PATH = '/api/v0/chat/completion';
 const UPLOAD_PATH = '/api/v0/file/upload_file';
@@ -64,6 +64,32 @@ export function isMutedMessage(message) {
 export function isChallengeRequired(code, message) {
   if (Number(code) === 40303) return true;
   return /CHALLENGE_REQUIRED/i.test(String(message || ''));
+}
+
+/**
+ * DeepSeek 的登录态失效不走 HTTP 401，而是 HTTP 200 + 业务错误：
+ *
+ *   {"code":40003,"msg":"INVALID_TOKEN","data":null}
+ *
+ * 只按 res.status 判定的话，这类响应会落进通用的 UpstreamError，
+ * 对外表现为「登录失效被说成限流」/「单 token 时完全不标记」两种错误语义。
+ *
+ * 这里只认 **msg 精确等于这几个值**（不做宽松正则）：
+ * 「Authorization Failed (invalid token)」这类文案分不清是真失效还是风控临时拦截，
+ * 用它触发 24h 停用会把好号误锁一天（authFailed 一旦置位就不会自愈，必须换 token 才恢复）。
+ */
+const AUTH_INVALID_MESSAGES = new Set([
+  'INVALID_TOKEN',
+  'TOKEN_EXPIRED',
+  'TOKEN_INVALID',
+  'USER_NOT_FOUND',
+  'NOT_LOGGED_IN',
+]);
+
+/** 上游 msg / biz_msg 是否是明确的「登录态失效」 */
+export function isAuthInvalidMessage(message) {
+  if (!message) return false;
+  return AUTH_INVALID_MESSAGES.has(String(message).trim().toUpperCase());
 }
 
 /**
@@ -141,6 +167,14 @@ export class DirectEngine {
     this.fileCache = new Map();
     // 挑战闸门：key = 会话 id / 请求指纹，value = 解禁时间戳
     this.challengeGate = new Map();
+    /**
+     * 上传得到的 file id → 上传它的账号 index。
+     * DeepSeek 的附件/图片是**账号私有**的：用 A 账号上传、再用 B 账号发请求，
+     * ref_file_ids 会被静默忽略 —— 模型只看到「已作为附件上传」的说明却读不到内容，
+     * 表现为莫名其妙地回一句「我遇到了问题」或者干脆不干活。
+     * 所以发请求时要按 file id 把账号钉回上传方。
+     */
+    this.fileOwners = new Map();
     this.inflight = 0;
     this.closed = false;
     this.coldStarted = false;
@@ -308,6 +342,17 @@ export class DirectEngine {
     }
     await this.ensureStarted();
 
+    // 附件是账号私有的：只要有 ref_file_ids，就锁定上传它们的那个账号
+    const fileOwnerIndex = (() => {
+      if (!refFileIds?.length) return null;
+      const owners = refFileIds
+        .map((fileId) => this.fileOwners.get(fileId))
+        .filter((index) => index !== undefined);
+      if (!owners.length) return null;
+      // 混了多个账号的文件就没法钉死，交给轮询
+      return owners.every((index) => index === owners[0]) ? owners[0] : null;
+    })();
+
     this.inflight += 1;
     const startedAt = Date.now();
     const { accountCooldownMs, rateLimitBackoffMs, maxCooldownWaitMs } = this.config.runtime;
@@ -318,13 +363,26 @@ export class DirectEngine {
         if (signal?.aborted) throw new UpstreamError('客户端已断开', { status: 499, code: 'client_closed' });
 
         const now = Date.now();
+        // 带 ref_file_ids 时必须回到上传它们的那个账号：附件是账号私有的，
+        // 换号会让附件静默丢失（模型读不到内容）。
+        const pinned =
+          fileOwnerIndex !== null && fileOwnerIndex !== undefined
+            ? this.pool.accounts[fileOwnerIndex] ?? null
+            : null;
         // 复用会话时优先用会话所属账号；账号被换掉会让 parent 链失效，只能重建
-        const account = this.#pickAccount(now, session?.accountFingerprint);
+        const account =
+          pinned && pinned.cooldownUntil <= now
+            ? pinned
+            : this.#pickAccount(now, session?.accountFingerprint);
         if (!account) {
           const wait = this.pool.nextAvailableAt() - now;
           if (wait > maxCooldownWaitMs) {
-            // 所有号都是登录态失效停用的：报登录态错误，别让调用方误以为是限流
-            if (this.pool.allAuthFailed()) throw new AuthExpiredError();
+            // 所有号都是登录态失效停用的：报登录态错误，别让调用方误以为是限流。
+            //
+            // 以前只查 allAuthFailed()，但 INVALID_TOKEN 走的是普通 markUnavailable、
+            // 不会置 authFailed，于是「所有 token 都废了」被误报成 429 限流，
+            // 客户端会按 Retry-After 一直白等。改成看 lastFailureKind 才能识别。
+            if (this.pool.allAuthUnavailable()) throw new AuthExpiredError();
             throw new RateLimitError(
               `所有账号都在限流冷却中，约 ${Math.ceil(wait / 1000)}s 后恢复（可往号池加 token）`,
               { retryAfterMs: wait },
@@ -368,13 +426,23 @@ export class DirectEngine {
             retryAfterMs = AUTH_INVALID_COOLDOWN_MS;
             const authErrorCode = err.code
               || (String(err.message || '').includes('INVALID_TOKEN') ? 'INVALID_TOKEN' : 'auth_failed');
-            this.pool.markUnavailable(account, retryAfterMs, '登录态失效', { authFailed: true, authErrorCode });
-          } else if (this.pool.size > 1) {
-            // 上游报错/人机验证：有别的号就轮换，没有别的号就别把自己锁死
-            retryAfterMs = Math.max(1000, accountCooldownMs);
-            this.pool.markUnavailable(account, retryAfterMs, err.message || '账号不可用');
+            this.pool.markUnavailable(account, retryAfterMs, '登录态失效', {
+              authFailed: true,
+              authErrorCode,
+              kind: 'auth',
+            });
           } else {
-            throw err;
+            // 上游报错 / 人机验证 / 登录态问题：先标记这个号，免得下次请求又从它开始重撞一遍。
+            //
+            // 以前这里分叉：pool.size > 1 才标记，单 token 直接 throw 什么都不记 ——
+            // 实测单 token 时 cooldownMs=0、errorCount=0、lastError=null、连一条 WARN 都没有，
+            // 每次请求都真打一次上游，白付一次 session + PoW。
+            //
+            // 标记但不「锁死」：用一个很短的冷却（最多 1s），这样唯一的号不会被困住，
+            // 又能把 lastError / errorCount 留下来，让调用方在 /healthz 和日志里看得见。
+            retryAfterMs = Math.min(1000, Math.max(0, accountCooldownMs));
+            this.pool.markUnavailable(account, retryAfterMs, err.message || '账号不可用');
+            if (this.pool.size === 1) throw err;
           }
 
           if (partialOutput) throw err;
@@ -600,7 +668,9 @@ export class DirectEngine {
             this.log.debug(`账号 #${account.index + 1} PoW 被拒（${message}），重新获取后重试一次`);
             continue;
           }
-          if (res.status === 401 || res.status === 403) throw new AuthExpiredError();
+          if (res.status === 401 || res.status === 403 || isAuthInvalidMessage(message)) {
+            throw new AuthExpiredError(message);
+          }
           // 禁言是账号级风控：既不重试（重试只会加重风控），也不当成凭据失效
           if (isMutedMessage(message)) {
             throw new RateLimitError(
@@ -644,26 +714,35 @@ export class DirectEngine {
         let emittedContent = '';
         let emittedReasoning = '';
         let firstTokenAt = 0;
+        // 增量追踪器：正常追加时只 join 新增量，不拼全文（见 stream.mjs）。
+        // 追踪器返回 null（片段被改写/回退）时回退到全文 join + 前缀校验。
+        const contentTracker = createTextTracker();
+        const reasoningTracker = createTextTracker();
+
+        const emitOne = (tracker, type, emitted, onEmit) => {
+          const delta = tracker(state.fragments, type);
+          if (delta) {
+            if (!firstTokenAt) firstTokenAt = Date.now();
+            onEmit?.(delta);
+            return emitted + delta;
+          }
+          if (delta === null) {
+            const full = state.fragments
+              .filter((f) => f?.type === type)
+              .map((f) => f.content || '')
+              .join('');
+            if (full.length > emitted.length && full.startsWith(emitted)) {
+              if (!firstTokenAt) firstTokenAt = Date.now();
+              onEmit?.(full.slice(emitted.length));
+              return full;
+            }
+          }
+          return emitted;
+        };
 
         const emit = () => {
-          const content = state.fragments
-            .filter((f) => f?.type === 'RESPONSE')
-            .map((f) => f.content || '')
-            .join('');
-          if (content.length > emittedContent.length && content.startsWith(emittedContent)) {
-            if (!firstTokenAt) firstTokenAt = Date.now();
-            onDelta?.(content.slice(emittedContent.length));
-            emittedContent = content;
-          }
-          const reasoning = state.fragments
-            .filter((f) => f?.type === 'THINK')
-            .map((f) => f.content || '')
-            .join('');
-          if (reasoning.length > emittedReasoning.length && reasoning.startsWith(emittedReasoning)) {
-            if (!firstTokenAt) firstTokenAt = Date.now();
-            onThinking?.(reasoning.slice(emittedReasoning.length));
-            emittedReasoning = reasoning;
-          }
+          emittedContent = emitOne(contentTracker, 'RESPONSE', emittedContent, onDelta);
+          emittedReasoning = emitOne(reasoningTracker, 'THINK', emittedReasoning, onThinking);
         };
 
         const parser = createSseParser((payload, event) => {
@@ -772,7 +851,6 @@ export class DirectEngine {
   async uploadImages(images = []) {
     if (!images.length) return [];
     await this.ensureStarted();
-    const account = this.#uploadAccount();
 
     const ids = [];
     for (const image of images) {
@@ -785,6 +863,7 @@ export class DirectEngine {
           code: 'image_too_large',
         });
       }
+      const account = this.#uploadAccount(this.#contentHash(buffer));
       ids.push(
         await this.#uploadFile(account, {
           buffer,
@@ -803,7 +882,6 @@ export class DirectEngine {
   async uploadAttachments(files = []) {
     if (!files.length) return [];
     await this.ensureStarted();
-    const account = this.#uploadAccount();
 
     const ids = [];
     for (const file of files) {
@@ -816,6 +894,7 @@ export class DirectEngine {
           code: 'attachment_too_large',
         });
       }
+      const account = this.#uploadAccount(this.#contentHash(buffer));
       ids.push(
         await this.#uploadFile(account, {
           buffer,
@@ -827,11 +906,44 @@ export class DirectEngine {
     return ids;
   }
 
-  #uploadAccount() {
-    const picked = this.pool.pick(Date.now(), (account) => this.scheduler.load(account))
-      || this.pool.accounts[0];
-    if (!picked) throw new AuthExpiredError();
-    return picked;
+  /**
+   * 选一个账号来上传。
+   *
+   * 用内容 hash 决定账号（而不是每次轮询），这样：
+   *  - 同一份内容永远落在同一个账号上，`文件 → 账号` 的归属稳定，缓存才能真正命中；
+   *  - 轮询会让同一内容每次换号上传，既浪费请求，也会让缓存永远 miss。
+   *
+   * 优先在「已经存过这份内容」的账号上复用，否则按 hash 落到某个可用账号。
+   */
+  #uploadAccount(hash) {
+    if (this.pool.size === 1) return this.pool.accounts[0];
+
+    // 已经缓存过这份内容：必须回到那个账号，否则文件 id 不通
+    if (hash) {
+      for (const [key, entry] of this.fileCache) {
+        if (entry.expiresAt > Date.now() && key.endsWith(`:${hash}`)) {
+          const index = Number.parseInt(key.slice(0, key.indexOf(':')), 10);
+          const owner = this.pool.accounts[index];
+          if (owner && owner.cooldownUntil <= Date.now()) return owner;
+        }
+      }
+      // 按 hash 稳定映射到一个账号；避开冷却中的
+      const now = Date.now();
+      const usable = this.pool.accounts.filter((account) => account.cooldownUntil <= now);
+      const list = usable.length ? usable : this.pool.accounts;
+      let sum = 0;
+      for (let i = 0; i < hash.length; i += 1) sum = (sum * 31 + hash.charCodeAt(i)) % 1000003;
+      return list[sum % list.length];
+    }
+
+    const account = this.pool.pick() || this.pool.accounts[0];
+    if (!account) throw new AuthExpiredError();
+    return account;
+  }
+
+  /** 内容 hash（和 #uploadFile 里的缓存 key 用同一套算法） */
+  #contentHash(buffer) {
+    return crypto.createHash('sha256').update(buffer).digest('hex');
   }
 
   async #uploadFile(account, file) {
@@ -844,9 +956,21 @@ export class DirectEngine {
 
   async #uploadFileNow(account, file) {
     const { buffer, mime, name } = file;
-    const hash = crypto.createHash('sha256').update(buffer).digest('hex');
-    const cached = this.fileCache.get(hash);
+    const hash = this.#contentHash(buffer);
+    // 同一个文件在不同账号下是两个互不相通的 file id，缓存必须按账号隔离
+    const cacheKey = `${account.index}:${hash}`;
+    const cached = this.fileCache.get(cacheKey);
     if (cached && cached.expiresAt > Date.now()) return cached.id;
+    // 原来只在命中时检查过期：长期运行的进程里过期条目永远不删，
+    // Map 会随上传次数无限增长。这里在写入前顺手清掉过期项并设上限。
+    if (cached) this.fileCache.delete(cacheKey);
+    if (this.fileCache.size >= 512) {
+      const now = Date.now();
+      for (const [key, entry] of this.fileCache) {
+        if (entry.expiresAt <= now) this.fileCache.delete(key);
+      }
+      if (this.fileCache.size >= 512) this.fileCache.delete(this.fileCache.keys().next().value);
+    }
 
     const powHeader = await this.#powHeaderFor(account, UPLOAD_PATH);
     const form = new FormData();
@@ -870,8 +994,10 @@ export class DirectEngine {
     const body = await readJsonSafely(res);
     const id = body?.data?.biz_data?.id;
     if (!id) {
-      if (res.status === 401 || res.status === 403) throw new AuthExpiredError();
       const message = body?.msg || body?.data?.biz_msg || `HTTP ${res.status}`;
+      if (res.status === 401 || res.status === 403 || isAuthInvalidMessage(message)) {
+        throw new AuthExpiredError(message);
+      }
       if (isMutedMessage(message)) {
         throw new RateLimitError(`上游提示账号被禁言（${message}）：账号级风控，稍后重试`, {
           retryAfterMs: this.config.runtime.mutedCooldownMs,
@@ -882,8 +1008,9 @@ export class DirectEngine {
       throw new UpstreamError(`上传附件失败：${message}`, { code: 'attachment_upload_failed' });
     }
 
-    this.fileCache.set(hash, { id, expiresAt: Date.now() + FILE_CACHE_TTL_MS });
-    this.log.debug('附件已上传', { name, bytes: buffer.length });
+    this.fileCache.set(cacheKey, { id, expiresAt: Date.now() + FILE_CACHE_TTL_MS });
+    this.fileOwners.set(id, account.index);
+    this.log.debug('附件已上传', { name, bytes: buffer.length, account: account.index + 1 });
     return id;
   }
 
@@ -928,8 +1055,10 @@ export class DirectEngine {
     const body = await readJsonSafely(res);
     const session = body?.data?.biz_data?.chat_session;
     if (!session?.id) {
-      if (res.status === 401 || res.status === 403) throw new AuthExpiredError();
       const message = body?.msg || body?.data?.biz_msg || `HTTP ${res.status}`;
+      if (res.status === 401 || res.status === 403 || isAuthInvalidMessage(message)) {
+        throw new AuthExpiredError(message);
+      }
       if (isMutedMessage(message)) {
         throw new RateLimitError(`上游提示账号被禁言（${message}）：账号级风控，稍后重试`, {
           retryAfterMs: this.config.runtime.mutedCooldownMs,
@@ -951,11 +1080,11 @@ export class DirectEngine {
     const body = await readJsonSafely(res);
     const challenge = body?.data?.biz_data?.challenge;
     if (!challenge) {
-      if (res.status === 401 || res.status === 403) throw new AuthExpiredError();
-      throw new UpstreamError(
-        `获取 PoW 挑战失败：${body?.msg || body?.data?.biz_msg || `HTTP ${res.status}`}`,
-        { code: 'pow_challenge_failed' },
-      );
+      const message = body?.msg || body?.data?.biz_msg || `HTTP ${res.status}`;
+      if (res.status === 401 || res.status === 403 || isAuthInvalidMessage(message)) {
+        throw new AuthExpiredError(message);
+      }
+      throw new UpstreamError(`获取 PoW 挑战失败：${message}`, { code: 'pow_challenge_failed' });
     }
     return challenge;
   }

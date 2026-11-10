@@ -5,6 +5,8 @@ import { spawn } from 'node:child_process';
 import { chromium } from 'playwright';
 
 import { ApiError } from '../errors.mjs';
+import { escapeHtml, readJsonBody, requireApiKey, sendHtml, sendJson } from '../http.mjs';
+import { parseEnvText } from '../util.mjs';
 import { loadTokens, maskToken, normalizeUserToken, saveTokens } from '../auth.mjs';
 import { createEngine } from '../engine.mjs';
 import { modelsResponse } from '../openai/response.mjs';
@@ -102,7 +104,7 @@ export function createAdminHandler({ config, logger, web }) {
     }
 
     if (url.pathname.startsWith('/admin/api/')) {
-      requireAdminAuth(req, config);
+      requireApiKey(req, config, { message: '需要 API Key' });
       try {
         await handleApi(req, res, url);
       } catch (err) {
@@ -133,17 +135,17 @@ export function createAdminHandler({ config, logger, web }) {
     }
 
     if (route === 'POST /admin/api/accounts/verify') {
-      const body = await readJsonBody(req);
+      const body = await readJsonBody(req, 2 * 1024 * 1024);
       return sendJson(res, 200, await verifyTokens(body.tokens));
     }
 
     if (route === 'POST /admin/api/accounts') {
-      const body = await readJsonBody(req);
+      const body = await readJsonBody(req, 2 * 1024 * 1024);
       return sendJson(res, 200, saveAccounts(body));
     }
 
     if (route === 'POST /admin/api/accounts/remove') {
-      const body = await readJsonBody(req);
+      const body = await readJsonBody(req, 2 * 1024 * 1024);
       return sendJson(res, 200, removeAccount(body));
     }
 
@@ -152,7 +154,7 @@ export function createAdminHandler({ config, logger, web }) {
     }
 
     if (route === 'PUT /admin/api/config') {
-      const body = await readJsonBody(req);
+      const body = await readJsonBody(req, 2 * 1024 * 1024);
       return sendJson(res, 200, saveConfig(body));
     }
 
@@ -748,29 +750,11 @@ export function createAdminHandler({ config, logger, web }) {
   }
 
   function readEnvFile() {
-    const out = {};
-    let text;
     try {
-      text = fs.readFileSync(envFile, 'utf8');
+      return parseEnvText(fs.readFileSync(envFile, 'utf8'));
     } catch {
-      return out;
+      return {};
     }
-    for (const rawLine of text.split(/\r?\n/)) {
-      const line = rawLine.trim();
-      if (!line || line.startsWith('#')) continue;
-      const eq = line.indexOf('=');
-      if (eq <= 0) continue;
-      const key = line.slice(0, eq).trim();
-      let value = line.slice(eq + 1).trim();
-      if (
-        (value.startsWith('"') && value.endsWith('"')) ||
-        (value.startsWith("'") && value.endsWith("'"))
-      ) {
-        value = value.slice(1, -1);
-      }
-      out[key] = value;
-    }
-    return out;
   }
 
   /** 当前进程里生效的值（没有写进 .env 但会从默认值/环境变量来） */
@@ -869,18 +853,35 @@ export function createAdminHandler({ config, logger, web }) {
     const inside = resolved === distDir || resolved.startsWith(distDir + path.sep);
     const fallback = path.join(distDir, 'index.html');
 
-    let file = inside && fs.existsSync(resolved) && fs.statSync(resolved).isFile() ? resolved : fallback;
-    if (!fs.existsSync(file)) {
+    let stat = null;
+    try {
+      stat = inside ? fs.statSync(resolved) : null;
+    } catch {
+      stat = null;
+    }
+    let file = stat?.isFile() ? resolved : fallback;
+    try {
+      stat = fs.statSync(file);
+    } catch {
       return sendHtml(res, 503, buildMissingPage());
     }
+    if (!stat.isFile()) return sendHtml(res, 503, buildMissingPage());
     const ext = path.extname(file).toLowerCase();
-    const body = fs.readFileSync(file);
     res.writeHead(200, {
       'Content-Type': STATIC_MIME[ext] || 'application/octet-stream',
-      'Content-Length': body.length,
+      'Content-Length': stat.size,
       'Cache-Control': ext === '.html' ? 'no-cache' : 'public, max-age=3600',
     });
-    res.end(req.method === 'HEAD' ? undefined : body);
+    // 流式发送：原来每次请求都把整个文件（主 JS 约 588KB）读进内存，
+    // 并发访问后台时内存峰值随并发线性增长；流式只占一个小缓冲区。
+    if (req.method === 'HEAD') {
+      res.end();
+      return;
+    }
+    fs.createReadStream(file).on('error', () => {
+      if (!res.headersSent) sendHtml(res, 503, buildMissingPage());
+      else res.end();
+    }).pipe(res);
   }
 }
 
@@ -888,40 +889,7 @@ export function createAdminHandler({ config, logger, web }) {
  * 工具函数
  * -------------------------------------------------------------------- */
 
-function requireAdminAuth(req, config) {
-  if (!config.server.apiKey) return;
-  const header = req.headers.authorization || '';
-  const bearer = header.startsWith('Bearer ') ? header.slice(7).trim() : '';
-  const apiKeyHeader = typeof req.headers['x-api-key'] === 'string' ? req.headers['x-api-key'].trim() : '';
-  if (bearer !== config.server.apiKey && apiKeyHeader !== config.server.apiKey) {
-    throw new ApiError(401, '需要 API Key', { type: 'authentication_error', code: 'invalid_api_key' });
-  }
-}
 
-function readJsonBody(req) {
-  return new Promise((resolve, reject) => {
-    const chunks = [];
-    let size = 0;
-    req.on('data', (chunk) => {
-      size += chunk.length;
-      if (size > 2 * 1024 * 1024) {
-        reject(new ApiError(413, '请求体过大'));
-        req.destroy();
-        return;
-      }
-      chunks.push(chunk);
-    });
-    req.on('end', () => {
-      if (!chunks.length) return resolve({});
-      try {
-        resolve(JSON.parse(Buffer.concat(chunks).toString('utf8')));
-      } catch {
-        reject(new ApiError(400, '请求体不是合法 JSON'));
-      }
-    });
-    req.on('error', reject);
-  });
-}
 
 function clampInt(raw, min, max, fallback) {
   const n = Number.parseInt(raw ?? '', 10);
@@ -929,19 +897,7 @@ function clampInt(raw, min, max, fallback) {
   return Math.min(max, Math.max(min, n));
 }
 
-function sendJson(res, status, payload) {
-  const body = JSON.stringify(payload);
-  res.writeHead(status, {
-    'Content-Type': 'application/json; charset=utf-8',
-    'Content-Length': Buffer.byteLength(body),
-  });
-  res.end(body);
-}
 
-function sendHtml(res, status, html) {
-  res.writeHead(status, { 'Content-Type': 'text/html; charset=utf-8' });
-  res.end(html);
-}
 
 function buildMissingPage() {
   return `<!doctype html><html lang="zh-CN"><meta charset="utf-8">
@@ -958,6 +914,3 @@ npm --prefix web run build</pre>
 </html>`;
 }
 
-function escapeHtml(s) {
-  return String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
-}

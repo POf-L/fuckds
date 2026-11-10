@@ -17,7 +17,45 @@ import { parseTextToolCalls, TOOL_RESULT_CLOSE, TOOL_RESULT_OPEN } from './text-
 
 export { readJsonObject };
 
-/** 把 OpenAI tools 定义渲染成「每行一个 JSON」的工具列表 */
+/** 压缩索引里描述保留多少字符 */
+const COMPACT_DESC_CHARS = 60;
+
+/**
+ * 压缩版工具声明：一行一个工具，只保留「能选对工具 + 能拼出必填参数」所需的信息。
+ *
+ *   bash(command:string*, timeout:number) — 执行 shell 命令
+ *
+ * 为什么需要：agent 动辄上百个工具，完整 JSON 声明能到 100KB，超过网页输入框上限，
+ * 以前会被整段挪进附件 —— 模型在正文里看不到工具声明，就会乱调工具
+ * （参数结构凭臆测，缺必填字段），最后干脆停摆。压缩后体积约剩 1/10。
+ *
+ * 星号标必填。描述截断只为省体积，选型够用即可；需要精确 schema 时走按需展开。
+ */
+export function renderCompactToolDeclarations(tools = []) {
+  const lines = [];
+  for (const tool of tools) {
+    const fn = tool?.function ?? tool;
+    if (!fn || typeof fn.name !== 'string' || !fn.name.trim()) continue;
+
+    const params = fn.parameters?.properties;
+    const required = new Set(Array.isArray(fn.parameters?.required) ? fn.parameters.required : []);
+    const args = params && typeof params === 'object'
+      ? Object.entries(params).map(([key, value]) => {
+          const type = value?.type || 'any';
+          return `${key}:${type}${required.has(key) ? '*' : ''}`;
+        })
+      : [];
+
+    const desc = String(fn.description ?? '')
+      .replace(/\s+/g, ' ')
+      .trim()
+      .slice(0, COMPACT_DESC_CHARS);
+
+    lines.push(`${fn.name.trim()}(${args.join(', ')})${desc ? ` — ${desc}` : ''}`);
+  }
+  return lines;
+}
+
 export function renderToolDeclarations(tools = []) {
   const lines = [];
   for (const tool of tools) {
@@ -26,9 +64,191 @@ export function renderToolDeclarations(tools = []) {
     const decl = { name: fn.name.trim() };
     if (fn.description) decl.description = String(fn.description);
     if (fn.parameters && typeof fn.parameters === 'object') decl.parameters = fn.parameters;
+    // required 原来只藏在 parameters.required 里，模型很容易漏看；
+    // 在顶层再写一份，提示词里的“全部必填参数必须出现”才有可对照的清单。
+    if (Array.isArray(fn.parameters?.required) && fn.parameters.required.length) {
+      decl.required = fn.parameters.required;
+    }
     lines.push(JSON.stringify(decl));
   }
   return lines;
+}
+
+/** 从 OpenAI tools 定义里取出「工具名 -> parameters schema」映射（供参数校验/纠正用） */
+export function getToolSchemas(tools = []) {
+  const map = new Map();
+  for (const tool of tools ?? []) {
+    const fn = tool?.function ?? tool;
+    if (!fn || typeof fn.name !== 'string' || !fn.name.trim()) continue;
+    map.set(fn.name.trim(), fn.parameters && typeof fn.parameters === 'object' ? fn.parameters : null);
+  }
+  return map;
+}
+
+function tryParseJson(text) {
+  if (typeof text !== 'string') return { ok: false };
+  try {
+    return { ok: true, value: JSON.parse(text) };
+  } catch {
+    return { ok: false };
+  }
+}
+
+function coerceScalar(value, schema, path, warnings) {
+  const type = Array.isArray(schema?.type) ? schema.type[0] : schema?.type;
+  if (!type || value === null || value === undefined) return value;
+  if (type === 'integer') {
+    if (typeof value === 'number' && Number.isInteger(value)) return value;
+    if (typeof value === 'string' && /^-?\d+$/.test(value.trim())) return Number.parseInt(value.trim(), 10);
+    if (typeof value === 'number') return Math.trunc(value);
+    warnings.push(`${path}: expected integer, got ${typeof value}`);
+    return value;
+  }
+  if (type === 'number') {
+    if (typeof value === 'number' && Number.isFinite(value)) return value;
+    if (typeof value === 'string' && value.trim() !== '' && Number.isFinite(Number(value.trim()))) {
+      return Number(value.trim());
+    }
+    warnings.push(`${path}: expected number, got ${typeof value}`);
+    return value;
+  }
+  if (type === 'boolean') {
+    if (typeof value === 'boolean') return value;
+    if (typeof value === 'string') {
+      const lower = value.trim().toLowerCase();
+      if (lower === 'true' || lower === '1' || lower === 'yes') return true;
+      if (lower === 'false' || lower === '0' || lower === 'no') return false;
+    }
+    warnings.push(`${path}: expected boolean, got ${typeof value}`);
+    return value;
+  }
+  if (type === 'string') {
+    if (typeof value === 'string') return value;
+    if (typeof value === 'number' || typeof value === 'boolean') return String(value);
+    warnings.push(`${path}: expected string, got ${typeof value}`);
+    return value;
+  }
+  if (type === 'array') {
+    if (Array.isArray(value)) {
+      return schema.items ? value.map((item, i) => coerceScalar(item, schema.items, `${path}[${i}]`, warnings)) : value;
+    }
+    if (typeof value === 'string') {
+      const parsed = tryParseJson(value.trim());
+      if (parsed.ok && Array.isArray(parsed.value)) {
+        return schema.items
+          ? parsed.value.map((item, i) => coerceScalar(item, schema.items, `${path}[${i}]`, warnings))
+          : parsed.value;
+      }
+    }
+    warnings.push(`${path}: expected array, got ${typeof value}`);
+    return value;
+  }
+  if (type === 'object') {
+    if (value && typeof value === 'object' && !Array.isArray(value)) {
+      if (!schema.properties) return value;
+      const out = { ...value };
+      for (const [key, sub] of Object.entries(schema.properties)) {
+        if (key in out) out[key] = coerceScalar(out[key], sub, `${path}.${key}`, warnings);
+      }
+      return out;
+    }
+    if (typeof value === 'string') {
+      const parsed = tryParseJson(value.trim());
+      if (parsed.ok && parsed.value && typeof parsed.value === 'object' && !Array.isArray(parsed.value)) {
+        return schema.properties ? coerceScalar(parsed.value, schema, path, warnings) : parsed.value;
+      }
+    }
+    warnings.push(`${path}: expected object, got ${typeof value}`);
+    return value;
+  }
+  return value;
+}
+
+/**
+ * 按工具声明纠正一次工具调用的参数，并返回警告（只含参数名，不含参数值，
+ * 避免把可能敏感的参数内容写进日志）。
+ *
+ * 纠正只做“类型可无歧义还原”的事，绝不编造缺失值：
+ * - "10" -> 10（integer）、"true" -> true（boolean）、"[\"a\"]" -> ["a"]（array）
+ *   —— 这正是 DSML 里 string="true" / 省略 string 属性时最常见的错法；
+ * - 大小写写错的参数名（Query -> query）按声明改名；
+ * - 整个参数对象被包进一层 args/arguments/parameters 时拆掉一层；
+ * - 必填缺失、枚举不符、无法还原的类型只警告、不改动、不丢弃调用：
+ *   丢弃会让客户端收到空回答，改错值比原样返回更糟。
+ * 没有声明（工具名不在 tools 里）时原样返回，只字不改。
+ *
+ * @param {{ name: string, arguments: string }} call
+ * @param {Map<string, object|null>} schemas getToolSchemas 的返回值
+ * @returns {{ arguments: string, warnings: string[] }}
+ */
+export function coerceToolCallArguments(call, schemas) {
+  const warnings = [];
+  if (!call || !schemas?.has?.(call.name)) return { arguments: call?.arguments ?? '{}', warnings };
+  let args;
+  try {
+    args = JSON.parse(call.arguments ?? '{}');
+  } catch {
+    return { arguments: call.arguments ?? '{}', warnings: [`${call.name}: arguments is not valid JSON`] };
+  }
+  if (!args || typeof args !== 'object' || Array.isArray(args)) {
+    return { arguments: call.arguments, warnings };
+  }
+  const schema = schemas.get(call.name);
+  if (!schema || typeof schema !== 'object') return { arguments: call.arguments, warnings };
+  const properties = schema.properties && typeof schema.properties === 'object' ? schema.properties : {};
+
+  // 单层包装：{args: {...}} / {arguments: {...}} / {parameters: {...}}，且
+  // 里层键至少有一个是声明里的参数名 —— 拆掉这层，保留里层。
+  const wrapperKeys = ['args', 'arguments', 'parameters'];
+  const ownKeys = Object.keys(args);
+  if (ownKeys.length === 1 && wrapperKeys.includes(ownKeys[0])) {
+    let inner = args[ownKeys[0]];
+    if (typeof inner === 'string') {
+      const parsed = tryParseJson(inner.trim());
+      if (parsed.ok) inner = parsed.value;
+    }
+    if (inner && typeof inner === 'object' && !Array.isArray(inner)) {
+      const innerKeys = Object.keys(inner);
+      if (innerKeys.some((k) => k in properties)) {
+        warnings.push(`${call.name}: unwrapped single "${ownKeys[0]}" wrapper`);
+        args = inner;
+      }
+    }
+  }
+
+  // 大小写改名（只在声明里找不到原名、且恰好有一个大小写不敏感的匹配时）
+  for (const key of Object.keys(args)) {
+    if (key in properties) continue;
+    const match = Object.keys(properties).find((p) => p.toLowerCase() === key.toLowerCase());
+    if (match) {
+      warnings.push(`${call.name}: renamed parameter "${key}" to "${match}"`);
+      args[match] = args[key];
+      delete args[key];
+    } else {
+      warnings.push(`${call.name}: unknown parameter "${key}" (kept as-is)`);
+    }
+  }
+
+  for (const [key, sub] of Object.entries(properties)) {
+    if (!(key in args)) continue;
+    args[key] = coerceScalar(args[key], sub, `${call.name}.${key}`, warnings);
+  }
+
+  if (Array.isArray(schema.required)) {
+    for (const key of schema.required) {
+      if (!(key in args) || args[key] === undefined) {
+        warnings.push(`${call.name}: missing required parameter "${key}" (not invented)`);
+      }
+    }
+  }
+  // enum 只警告：服务端替模型“选一个最接近的”是在编造参数。
+  for (const [key, sub] of Object.entries(properties)) {
+    if (key in args && Array.isArray(sub?.enum) && !sub.enum.includes(args[key])) {
+      warnings.push(`${call.name}: parameter "${key}" is not in its enum`);
+    }
+  }
+
+  return { arguments: JSON.stringify(args), warnings };
 }
 
 /**

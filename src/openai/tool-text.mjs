@@ -81,14 +81,22 @@ export function findEndTokenBlocks(text) {
  */
 export function findPendingEndToken(text, from = 0) {
   if (!text) return -1;
-  const lt = text.lastIndexOf('<');
-  if (lt < Math.max(0, from)) return -1;
-  const tail = text.slice(lt);
-  if (tail.length > 48) return -1;
-  if (!/^<[ \t]*[|｜][ \t]*(?:[|｜][ \t]*)?(?:E(?:N(?:D)?)?)?[ \t]*[|｜]?[ \t]*$/.test(tail)) return -1;
-  // 已经写完的 <|END|> 交给 findEndTokenBlocks 处理，这里只扣没写完的
-  if (/^<[ \t]*[|｜][ \t]*(?:[|｜][ \t]*)?END[ \t]*(?:[|｜][ \t]*){1,2}[ \t]*>$/i.test(tail)) return -1;
-  return lt;
+  // 原来用 lastIndexOf('<')：全文没有 '<' 时也要从头扫到尾，每个 push 一次。
+  // 半截 <|END 一定在未发出部分（已发出的早已被处理），从 from 往后找即可；
+  // 后缀里可能有多个 '<'，逐个检查，第一个匹配半截模式的就返回。
+  const start = Math.max(0, from);
+  let lt = text.indexOf('<', start);
+  while (lt !== -1) {
+    const tail = text.slice(lt);
+    if (tail.length <= 48 && /^<[ \t]*[|｜][ \t]*(?:[|｜][ \t]*)?(?:E(?:N(?:D)?)?)?[ \t]*[|｜]?[ \t]*$/.test(tail)) {
+      // 已经写完的 <|END|> 交给 findEndTokenBlocks 处理，这里只扣没写完的
+      if (!/^<[ \t]*[|｜][ \t]*(?:[|｜][ \t]*)?END[ \t]*(?:[|｜][ \t]*){1,2}[ \t]*>$/i.test(tail)) {
+        return lt;
+      }
+    }
+    lt = text.indexOf('<', lt + 1);
+  }
+  return -1;
 }
 
 /**
@@ -498,14 +506,20 @@ function pendingProtocolStart(text, from) {
   const start = Math.max(0, from);
   const candidates = [];
 
-  LABEL_TOKEN.lastIndex = 0;
+  // 原来从 0 开始全文扫描：每个 push 都要扫一遍已发出的全文。
+  // 从 start（已发出位置）开始扫即可：一个正在成形的标签若起点在
+  // start 之前，上一次 push 时 pending 逻辑就已经把 emitted 扣在
+  // 它的起点，不可能越过它；越过的标签已经发出，扣也来不及了。
+  LABEL_TOKEN.lastIndex = start;
   let match;
   while ((match = LABEL_TOKEN.exec(text)) !== null) {
-    if (match.index < start) continue;
     if (PENDING_LABEL_TAIL.test(text.slice(match.index))) candidates.push(match.index);
   }
 
-  const lt = text.lastIndexOf('<');
+  // 原生 token 只可能在尾部：从 start 往后找最后一个 '<'，不要全文 lastIndexOf。
+  const suffixForLt = text.slice(start);
+  const ltInSuffix = suffixForLt.lastIndexOf('<');
+  const lt = ltInSuffix >= 0 ? start + ltInSuffix : -1;
   if (lt >= start && PENDING_NATIVE_TOKEN.test(text.slice(lt))) candidates.push(lt);
 
   // 半截纯文本哨兵：`[[TOO`、`[[TOOL_CALL]]{"name"...`（还没闭合）→ 先扣住
@@ -516,7 +530,12 @@ function pendingProtocolStart(text, from) {
   const openResult = scanTextToolResultBlocks(text, start).find((block) => !block.complete);
   if (openResult) candidates.push(openResult.start);
 
-  const lineStart = text.lastIndexOf('\n') + 1;
+  // 最后一行：只在未发出部分里有换行时才需要检查。原来用全文
+  // lastIndexOf('\n')，全文没有换行时每个 push 都要扫一遍全文。
+  // 未发出部分里没有换行，说明最后一行起点在 start 之前，不可能是
+  // 新出现的段标题行，直接跳过。
+  const nlInSuffix = suffixForLt.lastIndexOf('\n');
+  const lineStart = nlInSuffix >= 0 ? start + nlInSuffix + 1 : -1;
   if (lineStart >= start) {
     const line = text.slice(lineStart);
     // 只有 markdown 标题行（# / ## …）才可能是协议段标题，
@@ -593,8 +612,31 @@ export class ToolMarkupStreamFilter {
 
   #findCut() {
     const candidates = [];
-    const blocks = findToolMarkup(this.buffer);
-    if (blocks.length) candidates.push({ index: blocks[0].start, kind: blocks[0].kind });
+    // 原来每个 push 都对整个已累积 buffer 做一次全文正则扫描：
+    // 输出越长，每帧成本越高，同样是 O(总长度) 的二次开销。
+    // 快路径：长文本下，先看已发出位置附近 128 字符 + 未发出部分里
+    // 有没有协议触发词（'<'、RESULT/DO、##、段标题）。没有，说明本帧
+    // 不可能新出现一个协议块 —— 已发出的部分早已被扫描过，而一个
+    // 正在成形的块（DSML 标签、DO:/RESULT:、段标题）一定会被 pending
+    // 逻辑扣住 emitted，使其起点落在检查范围内。没有触发词就直接
+    // 跳过全文扫描；有触发词时仍走全文扫描，正确性不受影响。
+    if (this.buffer.length >= 4096) {
+      const tail = this.buffer.slice(Math.max(0, this.emitted - 128));
+      if (!/[<]|RESULT|DO|##|_ROLE_MESSAGES|TOOL_FUNCTIONS/i.test(tail)) return null;
+    }
+    // 已发出的部分不可能再出现新协议块（真有块，早已被截断或扣住），
+    // 所以长文本下只扫描“已发出位置所在行的行首”之后的部分：
+    // 行首之前的内容都已发出，且行内协议块的起点一定不早于该行首
+    // （否则它早已被 pending 逻辑扣住，emitted 不会越过它）。
+    // 短文本（<4KB）仍走全文扫描，保持与旧行为逐字一致。
+    let searchFrom = 0;
+    if (this.buffer.length >= 4096 && this.emitted > 0) {
+      searchFrom = this.buffer.lastIndexOf('\n', this.emitted - 1) + 1;
+    }
+    const blocks = findToolMarkup(searchFrom ? this.buffer.slice(searchFrom) : this.buffer);
+    if (blocks.length) {
+      candidates.push({ index: searchFrom + blocks[0].start, kind: blocks[0].kind });
+    }
     const dsml = findDsmlStart(this.buffer, this.emitted);
     // 只有标签已经完整时才永久截断；半截标签由 holdBack 兜住
     if (dsml?.complete) candidates.push({ index: dsml.index, kind: 'TOOL_CALL' });

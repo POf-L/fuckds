@@ -16,8 +16,7 @@ import {
 } from './openai/response.mjs';
 import { SseWriter } from './openai/sse.mjs';
 import { reconcileStreamedText } from './openai/tool-text.mjs';
-
-const MAX_BODY_BYTES = 8 * 1024 * 1024;
+import { escapeHtml, readJsonBody as readJson, requireApiKey as requireAuth, sendHtml, sendJson } from './http.mjs';
 
 export function createServer({ config, logger, web }) {
   const log = logger.child('http');
@@ -390,74 +389,16 @@ export function createServer({ config, logger, web }) {
   return server;
 }
 
-/* -------------------------------------------------------------------- *
- * 工具函数
- * -------------------------------------------------------------------- */
-
-function requireAuth(req, config) {
-  if (!config.server.apiKey) return;
-  const header = req.headers.authorization || '';
-  const bearer = header.startsWith('Bearer ') ? header.slice(7).trim() : '';
-  // Anthropic 官方 SDK 用 x-api-key
-  const apiKeyHeader = typeof req.headers['x-api-key'] === 'string' ? req.headers['x-api-key'].trim() : '';
-  if (bearer !== config.server.apiKey && apiKeyHeader !== config.server.apiKey) {
-    throw new ApiError(401, 'API Key 无效', { type: 'authentication_error', code: 'invalid_api_key' });
-  }
-}
-
-function readJson(req) {
-  return new Promise((resolve, reject) => {
-    const chunks = [];
-    let size = 0;
-    req.on('data', (chunk) => {
-      size += chunk.length;
-      if (size > MAX_BODY_BYTES) {
-        reject(new ApiError(413, '请求体过大', { code: 'body_too_large' }));
-        req.destroy();
-        return;
-      }
-      chunks.push(chunk);
-    });
-    req.on('end', () => {
-      if (!chunks.length) return resolve({});
-      try {
-        resolve(JSON.parse(Buffer.concat(chunks).toString('utf8')));
-      } catch {
-        reject(new ApiError(400, '请求体不是合法 JSON', { code: 'invalid_json' }));
-      }
-    });
-    req.on('error', reject);
-  });
-}
-
-function sendJson(res, status, payload) {
-  const body = JSON.stringify(payload);
-  res.writeHead(status, {
-    'Content-Type': 'application/json; charset=utf-8',
-    'Content-Length': Buffer.byteLength(body),
-  });
-  res.end(body);
-}
-
-function sendHtml(res, status, html) {
-  res.writeHead(status, { 'Content-Type': 'text/html; charset=utf-8' });
-  res.end(html);
-}
-
 /** 请求头里的对话标识（可选；没有就用消息前缀哈希） */
 function headerConversationId(req) {
   const value = req.headers['x-conversation-id'] || req.headers['x-session-id'];
   return typeof value === 'string' && value.trim() ? value.trim() : null;
 }
 
-function escapeHtml(s) {
-  return String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
-}
-
 export function landingPage(config) {
   const example = `curl http://${config.server.host}:${config.server.port}/v1/chat/completions \\
   -H "Content-Type: application/json" \\
-  -H "Authorization: Bearer ${config.server.apiKey || 'any'}" \\
+  -H "Authorization: Bearer <your-api-key>" \\
   -d '{
     "model": "deepseek-flash",
     "stream": true,
@@ -468,7 +409,7 @@ export function landingPage(config) {
   }'`;
   const anthropicExample = `curl http://${config.server.host}:${config.server.port}/v1/messages \\
   -H "Content-Type: application/json" \\
-  -H "x-api-key: ${config.server.apiKey || 'any'}" \\
+  -H "x-api-key: <your-api-key>" \\
   -H "anthropic-version: 2023-06-01" \\
   -d '{
     "model": "deepseek-flash",

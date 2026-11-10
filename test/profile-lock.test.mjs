@@ -41,7 +41,7 @@ test('陈旧锁（进程已死）：清锁后自己启动，并写入新锁', as
     readyTimeoutMs: 0,
     launch: async (extraArgs) => {
       launchCalls += 1;
-      assert.deepEqual(extraArgs, ['--remote-debugging-port=0']);
+      assert.deepEqual(extraArgs, ['--remote-debugging-port=0', '--no-proxy-server']);
       return fakeContext();
     },
   });

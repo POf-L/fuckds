@@ -9,7 +9,7 @@ test('401 错误体带 nextAction 与可执行命令，原始 code/message 保�
   const body = err.toJSON();
   assert.equal(body.error.code, 'deepseek_auth_required');
   assert.match(body.error.message, /INVALID_TOKEN/);
-  assert.match(body.error.message, /请重新登录：npm run auth:hybrid/);
+  assert.match(body.error.message, /请重新登录：.*npm run auth:hybrid/);
   assert.equal(body.error.nextAction.action, 're-login');
   assert.equal(body.error.nextAction.command, 'npm run auth:hybrid');
   assert.deepEqual(body.error.nextAction, AUTH_NEXT_ACTION);

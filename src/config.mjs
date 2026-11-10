@@ -2,6 +2,8 @@ import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 
+import { parseEnvText } from './util.mjs';
+
 const ROOT = path.resolve(import.meta.dirname, '..');
 
 /* ------------------------------------------------------------------ *
@@ -9,20 +11,7 @@ const ROOT = path.resolve(import.meta.dirname, '..');
  * ------------------------------------------------------------------ */
 function loadDotEnv(file) {
   if (!fs.existsSync(file)) return;
-  const text = fs.readFileSync(file, 'utf8');
-  for (const rawLine of text.split(/\r?\n/)) {
-    const line = rawLine.trim();
-    if (!line || line.startsWith('#')) continue;
-    const eq = line.indexOf('=');
-    if (eq <= 0) continue;
-    const key = line.slice(0, eq).trim();
-    let value = line.slice(eq + 1).trim();
-    if (
-      (value.startsWith('"') && value.endsWith('"')) ||
-      (value.startsWith("'") && value.endsWith("'"))
-    ) {
-      value = value.slice(1, -1);
-    }
+  for (const [key, value] of Object.entries(parseEnvText(fs.readFileSync(file, 'utf8')))) {
     if (process.env[key] === undefined) process.env[key] = value;
   }
 }
@@ -293,6 +282,17 @@ export function loadConfig(env = process.env) {
       sessionTtlMs: int(env.SESSION_TTL_MS, 6 * 60 * 60_000),
       // 最多保留多少个会话映射（LRU 淘汰）
       maxWebSessions: int(env.MAX_WEB_SESSIONS, 100),
+      /**
+       * 工具声明形态：
+       *   auto（默认） 完整声明放得下就用完整，需要拆分时改用压缩索引
+       *   full         始终完整 JSON 声明
+       *   compact      始终压缩索引（一行一个工具）
+       * 工具声明永远不会被挪进附件，放不下会直接报错。
+       */
+      toolDeclMode: (() => {
+        const value = str(env.TOOL_DECL_MODE, 'auto').toLowerCase();
+        return ['auto', 'full', 'compact'].includes(value) ? value : 'auto';
+      })(),
       // 浏览器模式：抓页面自己发出的 /api/v0/chat/completion 原始流，用模型原始输出
       // （含 DO 工具调用 token）作为权威文本，DOM 只负责流式展示。关掉退回纯 DOM 提取。
       browserCapture: bool(env.BROWSER_CAPTURE, true),

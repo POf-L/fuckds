@@ -41,3 +41,44 @@ test('collectImages: 只收 user 的图片部分', () => {
   assert.equal(images.length, 2);
   assert.equal(images[1].url, 'https://x/y.jpg');
 });
+
+test('collectImages: 历史里的图片不会被重复收集（聊久了不该报 too_many_images）', () => {
+  // 回归：以前扫描全部 messages，历史截图每轮都会被重新收集，
+  // 聊天轮次一多就超过 8 张直接 400 —— 表现是「一张图没发却报 9 张图」。
+  const messages = [{ role: 'user', content: [{ type: 'text', text: '开始' }] }];
+  for (let i = 0; i < 13; i += 1) {
+    messages.push({ role: 'assistant', content: 'ok' });
+    messages.push({
+      role: 'user',
+      content: [{ type: 'image_url', image_url: { url: `data:image/png;base64,${'A'.repeat(100 + i)}` } }],
+    });
+  }
+  messages.push({ role: 'assistant', content: 'ok' });
+  messages.push({ role: 'user', content: [{ type: 'text', text: '继续聊' }] });
+
+  assert.deepEqual(collectImages(messages), [], '最后一条 user 没有图片时不应该收集任何历史图片');
+});
+
+test('collectImages: 只看最后一条 user 消息里的图片', () => {
+  const messages = [
+    { role: 'user', content: [{ type: 'image_url', image_url: { url: 'data:image/png;base64,OLD' } }] },
+    { role: 'assistant', content: 'ok' },
+    { role: 'user', content: [{ type: 'image_url', image_url: { url: 'data:image/png;base64,NEW' } }] },
+  ];
+  const images = collectImages(messages);
+  assert.equal(images.length, 1);
+  assert.equal(images[0].url, 'data:image/png;base64,NEW');
+});
+
+test('collectImages: 最后一条消息自己超过 8 张才报错', () => {
+  const messages = [
+    {
+      role: 'user',
+      content: Array.from({ length: 9 }, (_, i) => ({
+        type: 'image_url',
+        image_url: { url: `data:image/png;base64,IMG${i}` },
+      })),
+    },
+  ];
+  assert.throws(() => collectImages(messages), /一条请求最多 8 张图片/);
+});
